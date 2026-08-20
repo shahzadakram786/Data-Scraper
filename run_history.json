@@ -1,0 +1,226 @@
+[
+  {
+    "timestamp": "2026-07-15T19:09:57",
+    "action": "collect",
+    "total": 9476,
+    "with_email": 102,
+    "hit_rate": 1.1
+  },
+  {
+    "timestamp": "2026-07-16T19:43:22",
+    "action": "collect",
+    "total": 10459,
+    "with_email": 110,
+    "hit_rate": 1.1
+  },
+  {
+    "timestamp": "2026-07-22T22:54:24",
+    "action": "email_find",
+    "total": 404,
+    "with_email": 311,
+    "hit_rate": 77.0
+  },
+  {
+    "timestamp": "2026-07-23T20:21:15",
+    "action": "zocdoc_import",
+    "total": 427,
+    "with_email": 330,
+    "hit_rate": 77.3
+  },
+  {
+    "timestamp": "2026-07-23T20:51:54",
+    "action": "email_find",
+    "total": 494,
+    "with_email": 419,
+    "hit_rate": 84.8
+  },
+  {
+    "timestamp": "2026-07-23T20:59:14",
+    "action": "email_find",
+    "total": 504,
+    "with_email": 438,
+    "hit_rate": 86.9
+  },
+  {
+    "timestamp": "2026-07-23T21:00:44",
+    "action": "zocdoc_import",
+    "total": 514,
+    "with_email": 444,
+    "hit_rate": 86.4
+  },
+  {
+    "timestamp": "2026-07-23T21:05:11",
+    "action": "email_find",
+    "total": 509,
+    "with_email": 450,
+    "hit_rate": 88.4
+  },
+  {
+    "timestamp": "2026-07-23T21:10:03",
+    "action": "email_find",
+    "total": 509,
+    "with_email": 459,
+    "hit_rate": 90.2
+  },
+  {
+    "timestamp": "2026-07-23T21:36:13",
+    "action": "email_find",
+    "total": 5,
+    "with_email": 5,
+    "hit_rate": 100.0
+  },
+  {
+    "timestamp": "2026-07-23T21:46:48",
+    "action": "zocdoc_import",
+    "total": 93,
+    "with_email": 42,
+    "hit_rate": 45.2
+  },
+  {
+    "timestamp": "2026-07-23T22:55:43",
+    "action": "email_find",
+    "total": 93,
+    "with_email": 55,
+    "hit_rate": 59.1
+  },
+  {
+    "timestamp": "2026-07-23T23:03:28",
+    "action": "email_find",
+    "total": 93,
+    "with_email": 58,
+    "hit_rate": 62.4
+  },
+  {
+    "timestamp": "2026-07-23T23:06:31",
+    "action": "email_find",
+    "total": 93,
+    "with_email": 59,
+    "hit_rate": 63.4
+  },
+  {
+    "timestamp": "2026-07-27T19:18:02",
+    "action": "collect",
+    "total": 666,
+    "with_email": 0,
+    "hit_rate": 0.0
+  },
+  {
+    "timestamp": "2026-07-27T20:36:21",
+    "action": "email_find",
+    "total": 666,
+    "with_email": 84,
+    "hit_rate": 12.6
+  },
+  {
+    "timestamp": "2026-07-27T21:29:10",
+    "action": "pt_collect",
+    "total": 1123,
+    "with_email": 314,
+    "hit_rate": 28.0
+  },
+  {
+    "timestamp": "2026-08-03T17:39:17",
+    "action": "pt_collect",
+    "total": 1848,
+    "with_email": 108,
+    "hit_rate": 5.8
+  },
+  {
+    "timestamp": "2026-08-04T16:49:27",
+    "action": "pt_collect",
+    "total": 1979,
+    "with_email": 222,
+    "hit_rate": 11.2
+  },
+  {
+    "timestamp": "2026-08-05T12:32:23",
+    "action": "email_find",
+    "total": 110,
+    "with_email": 95,
+    "hit_rate": 86.4
+  },
+  {
+    "timestamp": "2026-08-05T13:56:32",
+    "action": "email_find",
+    "total": 120,
+    "with_email": 106,
+    "hit_rate": 88.3
+  },
+  {
+    "timestamp": "2026-08-05T14:08:59",
+    "action": "pt_collect",
+    "total": 138,
+    "with_email": 122,
+    "hit_rate": 88.4
+  },
+  {
+    "timestamp": "2026-08-07T10:50:06",
+    "action": "pt_collect",
+    "total": 821,
+    "with_email": 430,
+    "hit_rate": 52.4
+  },
+  {
+    "timestamp": "2026-08-07T11:09:43",
+    "action": "email_find",
+    "total": 817,
+    "with_email": 462,
+    "hit_rate": 56.5
+  },
+  {
+    "timestamp": "2026-08-10T13:32:34",
+    "action": "pt_collect",
+    "total": 817,
+    "with_email": 462,
+    "hit_rate": 56.5
+  },
+  {
+    "timestamp": "2026-08-10T13:35:16",
+    "action": "pt_collect",
+    "total": 817,
+    "with_email": 462,
+    "hit_rate": 56.5
+  },
+  {
+    "timestamp": "2026-08-10T13:46:27",
+    "action": "pt_collect",
+    "total": 817,
+    "with_email": 462,
+    "hit_rate": 56.5
+  },
+  {
+    "timestamp": "2026-08-10T13:50:11",
+    "action": "pt_collect",
+    "total": 817,
+    "with_email": 462,
+    "hit_rate": 56.5
+  },
+  {
+    "timestamp": "2026-08-10T14:11:13",
+    "action": "pt_collect",
+    "total": 0,
+    "with_email": 0,
+    "hit_rate": 0.0
+  },
+  {
+    "timestamp": "2026-08-20T12:55:00",
+    "action": "pt_collect",
+    "total": 0,
+    "with_email": 0,
+    "hit_rate": 0.0
+  },
+  {
+    "timestamp": "2026-08-20T12:55:36",
+    "action": "pt_collect",
+    "total": 0,
+    "with_email": 0,
+    "hit_rate": 0.0
+  },
+  {
+    "timestamp": "2026-08-20T12:55:57",
+    "action": "pt_collect",
+    "total": 0,
+    "with_email": 0,
+    "hit_rate": 0.0
+  }
+]

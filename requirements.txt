@@ -1,0 +1,11 @@
+requests
+openpyxl
+beautifulsoup4
+lxml
+ddgs
+gspread
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+oauth2client
+matplotlib
