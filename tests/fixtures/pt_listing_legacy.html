@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<title>Therapists in Ohio | Psychology Today</title>
+<!--
+  The older JSON-LD shape, where mainEntity was the list of providers directly
+  rather than an ItemList wrapping them. Psychology Today has shipped both, and
+  the parser must keep handling this one: a listing page that silently stops
+  parsing is exactly the failure this project spent ten days not noticing.
+-->
+<script type="application/ld+json">
+[
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": []
+  },
+  {
+    "@context": "https://schema.org",
+    "@type": "SearchResultsPage",
+    "mainEntity": [
+      {
+        "@type": "Person",
+        "name": "Marcus Webb",
+        "url": "https://www.psychologytoday.com/us/therapists/marcus-webb-columbus-oh/9876543",
+        "telephone": "(614) 545-0123",
+        "workLocation": {
+          "address": {
+            "addressLocality": "Columbus",
+            "addressRegion": "OH",
+            "postalCode": "43215"
+          }
+        }
+      },
+      {
+        "@type": "Person",
+        "name": "Dana Whitfield",
+        "@id": "https://www.psychologytoday.com/us/therapists/dana-whitfield-cleveland-oh/8765432",
+        "telephone": "216-472-0155",
+        "workLocation": {}
+      }
+    ]
+  }
+]
+</script>
+</head>
+<body>
+<div class="results-row">
+  <a href="/us/therapists/marcus-webb-columbus-oh/9876543">Marcus Webb</a>
+  <div class="profile-subtitle-credentials">Counselor, LPCC</div>
+</div>
+<div class="results-row">
+  <a href="/us/therapists/dana-whitfield-cleveland-oh/8765432">Dana Whitfield</a>
+</div>
+</body>
+</html>

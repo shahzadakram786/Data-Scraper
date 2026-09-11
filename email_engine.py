@@ -118,11 +118,28 @@ class EmailEngine:
     # How far from the provider's name a title still counts as describing them.
     ROLE_CONTEXT_CHARS = 120
 
+    # Titles and initials whose full stop is not the end of a sentence.
+    # Without this, "Our Founder, Dr. Priya Raman" reads as two sentences, the
+    # proximity rule concludes the title describes somebody else, and a genuine
+    # practice owner is missed — on therapist sites, where almost every name
+    # carries a "Dr." or a middle initial, that is a large blind spot.
+    ABBREVIATION_RE = re.compile(
+        r'\b(?:[A-Za-z]|Dr|Drs|Mr|Mrs|Ms|Mx|Prof|Rev|Hon|Sr|Jr|St|Ph|Psy|Ed|Md|Do|'
+        r'Lic|Inc|Ltd|Co|Est|Approx|No|vs|etc|eg|ie)\.', re.IGNORECASE)
+
+    @classmethod
+    def _strip_abbreviations(cls, text):
+        """Remove the full stops that belong to abbreviations, so only real
+        sentence endings remain for the proximity check."""
+        return cls.ABBREVIATION_RE.sub(lambda m: m.group(0)[:-1], text or "")
+
     # Therapist marketplaces and multi-state group practices. A provider with a
     # profile on one of these is an employee or a listed clinician, not the
     # owner — the founder named on such a site is someone else entirely (e.g.
     # Thriveworks' pages name AJ Centore as founder on every clinician's
-    # profile). Role detection is skipped for these outright.
+    # profile). Everything on such a page is the platform's rather than the
+    # provider's — its intake number, its corporate mailbox, its brand social
+    # accounts — so scrape_website_contact_info reads nothing from them at all.
     PLATFORM_DOMAINS = frozenset({
         "headway.co", "lifestance.com", "sondermind.com", "thriveworks.com",
         "betterhelp.com", "talkspace.com", "helloalma.com", "alma.com",
@@ -162,6 +179,47 @@ class EmailEngine:
     }
 
     JUNK_DOMAIN_FRAGMENTS = ("sentry.io", "wixpress.com", "godaddy.com", "cloudflare.com")
+
+    # Aggregator/directory sites that rank highly for a provider's name but are
+    # never the practice's own website. Without this the Website column fills up
+    # with pages like medifind.com/specialty/primary-care/US/TX/Jbsa+Lackland,
+    # and scraping those yields the aggregator's contact details, not the
+    # provider's.
+    DIRECTORY_DOMAINS = (
+        "nppes", "npiregistry", "npino", "npidb", "hipaaspace", "yelp",
+        "facebook", "linkedin", "healthgrades", "vitals", "doximity",
+        "medifind", "wellness.com", "findatopdoc", "sharecare", "ratemds",
+        "healthprofs", "zocdoc", "webmd", "caredash", "opencare", "mapquest",
+        "yellowpages", "bbb.org", "indeed", "glassdoor", "psychologytoday",
+    )
+
+    # Social profiles worth recording, longest-domain-first so "x.com" can't
+    # shadow a more specific match. Kept as a tuple of (domain, column) pairs
+    # rather than a dict so the column order below is deterministic.
+    SOCIAL_DOMAINS = (
+        ("linkedin.com", "LinkedIn"),
+        ("facebook.com", "Facebook"),
+        ("fb.com", "Facebook"),
+        ("instagram.com", "Instagram"),
+        ("twitter.com", "Other"),
+        ("x.com", "Other"),
+        ("youtube.com", "Other"),
+        ("youtu.be", "Other"),
+        ("tiktok.com", "Other"),
+        ("pinterest.com", "Other"),
+        ("threads.net", "Other"),
+        ("threads.com", "Other"),
+    )
+    SOCIAL_COLUMNS = ("LinkedIn", "Facebook", "Instagram", "Other")
+    # Share buttons, tracking pixels and login walls all live on these domains
+    # too; none of them is the practice's own profile.
+    SOCIAL_JUNK_FRAGMENTS = (
+        "sharer", "share.php", "/share", "intent/tweet", "intent/user",
+        "/plugins/", "/dialog/", "/login", "/signup", "/policies", "/tr?",
+        "/help", "/legal", "/privacy", "/terms", "/embed", "/widget",
+    )
+    # How many extra links to keep in the catch-all "Other Social" column.
+    MAX_OTHER_SOCIALS = 3
 
     # Free mailboxes are legitimate for a solo practitioner, so they're accepted
     # even though they don't match the practice's own domain.
@@ -223,63 +281,245 @@ class EmailEngine:
             return len(self.PREFERRED_PREFIXES)
         return sorted(emails, key=lambda e: (score(e), e))[0]
 
+    @classmethod
+    def _classify_social(cls, url):
+        """Returns (column, cleaned_url) for a social profile link, or None if
+        the URL is not a social profile worth keeping."""
+        parsed = urlparse(url or "")
+        if parsed.scheme not in ("http", "https"):
+            return None
+        host = parsed.netloc.split(":")[0].lower()
+        host = host[4:] if host.startswith("www.") else host
+        column = next((col for dom, col in cls.SOCIAL_DOMAINS
+                       if host == dom or host.endswith("." + dom)), None)
+        if column is None:
+            return None
+        low = url.lower()
+        if any(frag in low for frag in cls.SOCIAL_JUNK_FRAGMENTS):
+            return None
+        path = parsed.path.strip("/")
+        if not path:
+            return None  # a bare platform homepage, not anybody's profile
+        # "facebook.com/profile.php" only identifies a page when it carries the
+        # id in its query string, so that one keeps its query and the rest drop
+        # theirs (tracking params otherwise make identical links look distinct).
+        if path.lower().endswith("profile.php"):
+            if "id=" not in (parsed.query or "").lower():
+                return None
+            return column, f"{parsed.scheme}://{parsed.netloc}/{path}?{parsed.query}"
+        return column, f"{parsed.scheme}://{parsed.netloc}/{path}"
+
+    @classmethod
+    def extract_socials(cls, html_text, page_url=""):
+        """Finds the practice's social media profiles on a page.
+
+        Reads both the visible links and any schema.org `sameAs` block (which is
+        where a site that renders its social icons as SVG sprites still declares
+        them). Returns {"LinkedIn": url, "Facebook": url, "Instagram": url,
+        "Other": "url, url"} with only the keys that were actually found.
+        """
+        soup = BeautifulSoup(html_text, "lxml")
+        candidates = []
+        for a in soup.find_all("a", href=True):
+            candidates.append(urljoin(page_url, a["href"].strip()))
+        for script in soup.find_all("script", type="application/ld+json"):
+            for m in re.finditer(r'"sameAs"\s*:\s*(\[[^\]]*\]|"[^"]*")', script.string or ""):
+                candidates.extend(re.findall(r'https?://[^"\s,\]]+', m.group(1)))
+
+        found = {}
+        for url in candidates:
+            hit = cls._classify_social(url)
+            if not hit:
+                continue
+            column, clean = hit
+            bucket = found.setdefault(column, [])
+            if clean not in bucket:
+                bucket.append(clean)
+
+        socials = {}
+        for column in cls.SOCIAL_COLUMNS:
+            urls = found.get(column)
+            if not urls:
+                continue
+            if column == "Other":
+                socials[column] = ", ".join(urls[:cls.MAX_OTHER_SOCIALS])
+            else:
+                # The most specific link is the profile itself; a shorter one on
+                # the same domain is usually the platform's own section link.
+                socials[column] = max(urls, key=len)
+        return socials
+
+    # Words that appear in half the practice names in the country. Matching one
+    # of these proves nothing about which practice a search result is about.
+    GENERIC_ORG_WORDS = frozenset({
+        "the", "and", "inc", "llc", "pllc", "pc", "pa", "group", "center",
+        "centre", "clinic", "health", "healthcare", "care", "medical",
+        "services", "service", "associates", "association", "practice",
+        "counseling", "counselling", "therapy", "therapeutic", "wellness",
+        "psychiatry", "psychiatric", "psychology", "psychological", "behavioral",
+        "behavioural", "mental", "family", "solutions", "partners", "institute",
+        "professional", "consulting", "of", "for", "llp", "corp",
+    })
+    # A mailbox shaped like "first.last" belongs to a named person. If that
+    # person is not the provider, it is somebody else's address no matter how
+    # relevant the page is.
+    PERSONAL_LOCAL_PART_RE = re.compile(r'^[a-z]{2,}[._-][a-z]{2,}$')
+
+    @classmethod
+    def _result_corroborates(cls, result, email, person_name=None, org_name=None, phone=None):
+        """Whether a search result actually ties this email to this provider.
+
+        Without this check the phone/name search fallbacks attach whatever
+        address happens to appear in a result snippet — which is how a Southlake
+        psychiatrist ended up with a Canadian accessories shop's info@ address,
+        and an Austin one with a colleague's university mailbox plus two
+        strangers' gmails.
+
+        Two things must hold. First the *result* has to be about this provider:
+        it names them, names their practice distinctively, or quotes the phone
+        number that was searched for. Then the *address* has to plausibly be
+        theirs: on that page's own domain, or a freemail box named after them.
+        Matching only the first would accept a colleague's address off the
+        provider's own page; matching only the second is what the old code did,
+        and it accepted anything at all.
+        """
+        email = (email or "").lower()
+        domain = email.split("@")[-1]
+        local = email.split("@")[0]
+        href = result.get("href", "") or ""
+        text = f"{result.get('title', '')} {result.get('body', '')} {href}".lower()
+
+        surname = ""
+        first = ""
+        parts = (person_name or "").strip().split()
+        if parts:
+            surname = parts[-1].lower()
+            first = parts[0].lower()
+
+        # --- is this result about the provider? ---
+        about_provider = False
+        if phone:
+            digits = re.sub(r'\D', '', str(phone))
+            if len(digits) == 11 and digits.startswith('1'):
+                digits = digits[1:]
+            # Compare digits-only so "(210) 520-7160" matches "210-520-7160".
+            if len(digits) == 10 and digits in re.sub(r'\D', '', text):
+                about_provider = True
+        if not about_provider and len(surname) >= 3 and re.search(
+                r'\b%s\b' % re.escape(surname), text):
+            about_provider = True
+        if not about_provider:
+            for word in re.findall(r"[a-z]{4,}", (org_name or "").lower()):
+                if word not in cls.GENERIC_ORG_WORDS and word in text:
+                    about_provider = True
+                    break
+        if not about_provider:
+            return False
+
+        # --- could this address be theirs? ---
+        if domain in cls.FREEMAIL_DOMAINS:
+            # A personal mailbox is only this provider's if it is named after
+            # them; otherwise it is some other person quoted on the same page.
+            return bool(surname) and (surname in local or (len(first) >= 3 and first in local))
+        result_domain = cls._registrable_domain(urlparse(href).netloc)
+        if not result_domain or cls._registrable_domain(domain) != result_domain:
+            return False
+        if cls.PERSONAL_LOCAL_PART_RE.match(local) and surname:
+            return surname in local or (len(first) >= 3 and first in local)
+        return True
+
     def find_email(self, lead_data):
         org_name = lead_data.get("Organization Name")
         city = lead_data.get("City")
         state = lead_data.get("State")
         
+        person_name = " ".join(
+            p for p in (lead_data.get("Provider First Name"),
+                        lead_data.get("Provider Last Name")) if p).strip()
         if not org_name:
             # Try with provider name if org name is missing
-            org_name = f"{lead_data.get('Provider First Name')} {lead_data.get('Provider Last Name')}"
-            
+            org_name = person_name
+
         search_query = f"{org_name} {city} {state} medical practice website"
         website = self._find_website(search_query)
-        
+
         email = ""
         if website:
             lead_data["Website"] = website
-            email = self._scrape_website_for_email(website)
-            
+            contact = self.scrape_website_contact_info(website, person_name=person_name or None)
+            email = contact.get("email", "")
+            # The same pass already read the site's links, so record the
+            # practice's social profiles rather than re-fetching for them later.
+            for column, link in (contact.get("socials") or {}).items():
+                lead_data["Other Social" if column == "Other" else column] = link
+
         if not email:
-            # Fallback: direct email search
+            # Fallback: direct email search, attributed only if the result
+            # actually names this provider or sits on their own domain.
             email_query = f"{org_name} {city} {state} email contact"
-            email = self._search_for_email_directly(email_query)
-            
+            email = self._search_for_email_directly(
+                email_query, person_name=person_name or None,
+                org_name=lead_data.get("Organization Name") or None)
+
         lead_data["Email"] = email
         return lead_data
 
     def scrape_website_contact_info(self, url, person_name=None):
-        """Scrape an already-known website for the provider's email, phone and
-        ownership role in a single pass over the same pages.
+        """Scrape an already-known website for the provider's email, phone,
+        ownership role and social media profiles in a single pass over the same
+        pages.
 
-        Returns {"email", "phone", "phone_confidence", "role"}. Any value may
-        be "" if nothing trustworthy was found. When person_name is given, the
-        provider's own direct line is preferred over the practice's shared
-        line, and "role" reports whether the site describes them as the
-        Owner/Founder/CEO of the practice.
+        Returns {"email", "phone", "phone_confidence", "role", "socials"}. Any
+        value may be empty if nothing trustworthy was found. When person_name is
+        given, the provider's own direct line is preferred over the practice's
+        shared line, and "role" reports whether the site describes them as the
+        Owner/Founder/CEO of the practice. "socials" maps LinkedIn / Facebook /
+        Instagram / Other to the profile links the site links out to.
         """
-        empty = {"email": "", "phone": "", "phone_confidence": "", "role": ""}
+        empty = {"email": "", "phone": "", "phone_confidence": "", "role": "",
+                 "socials": {}}
         if not url:
             return dict(empty)
+        if self.is_platform_site(url):
+            # A marketplace profile page (Grow Therapy, Thriveworks, LifeStance,
+            # ...) publishes the *marketplace's* contact details: its central
+            # intake number, its corporate mailbox and its brand social
+            # accounts, identically on every clinician's page. Scraping it
+            # attributes all of that to whichever provider happens to be listed
+            # — two different Delaware therapists both came back with Grow
+            # Therapy's (646) number and Instagram. None of it is the
+            # provider's, so nothing here is worth reading; the caller still
+            # records the profile URL itself as the Website.
+            self.logger.info(
+                f"{url.split('/')[2]} is a therapist marketplace — its contact "
+                f"details and socials belong to the platform, not the provider, "
+                f"so they are not recorded.")
+            return dict(empty)
         site_domain = self._registrable_domain(urlparse(url).netloc)
-        is_platform = self.is_platform_site(url)
         emails = set()
         candidates = []
+        socials = {}
         role = ""
         for page, text in self._iter_candidate_pages(url):
             for e in re.findall(self.EMAIL_REGEX, text):
                 if self._is_valid_email(e) and self._belongs_to_site(e, site_domain):
                     emails.add(e)
             candidates.extend(self._extract_phones(text))
-            if not role and not is_platform:
+            try:
+                for column, link in self.extract_socials(text, page).items():
+                    socials.setdefault(column, link)
+            except Exception as e:  # never let a parse hiccup lose the contact info
+                self.logger.debug(f"Social link extraction failed on {page}: {e}")
+            if not role:
                 try:
                     role = self.detect_role(text, person_name)
-                except Exception as e:  # never let a parse hiccup lose the contact info
+                except Exception as e:
                     self.logger.debug(f"Role detection failed on {page}: {e}")
             # Stop as soon as there's nothing left to gain: an email, a
-            # personal number and a role. A personal number is worth reading
-            # the extra pages for rather than settling for the main line.
-            if emails and role and any(c["kind"] == "personal" for c in candidates):
+            # personal number, a role and at least one social profile. Social
+            # icons usually sit in the footer of the contact/about page, so
+            # stopping at the homepage would miss most of them.
+            if emails and role and socials and any(c["kind"] == "personal" for c in candidates):
                 break
         phone, confidence = self._choose_phone(candidates)
         return {
@@ -287,6 +527,7 @@ class EmailEngine:
             "phone": phone,
             "phone_confidence": confidence,
             "role": role,
+            "socials": socials,
         }
 
     @classmethod
@@ -346,34 +587,46 @@ class EmailEngine:
         reg = cls._registrable_domain(domain)
         return reg == site_domain or domain.endswith("." + site_domain)
 
-    def find_email_by_phone(self, phone):
+    def find_email_by_phone(self, phone, person_name=None, org_name=None):
         """Reverse-lookup fallback for providers with no listed website: search
         the phone number itself, the way a person pasting it into a browser
-        would, and see if a contact email surfaces in the results."""
+        would, and see if a contact email surfaces in the results.
+
+        person_name/org_name are what makes the result usable: an address is
+        only attributed to this provider when the result it came from actually
+        corroborates them (see _result_corroborates)."""
         if not phone:
             return ""
         query = f'"{phone}" email contact'
-        return self._search_for_email_directly(query)
+        return self._search_for_email_directly(query, person_name=person_name,
+                                                org_name=org_name, phone=phone)
 
-    def find_all_emails_by_phone(self, phone, max_results=8):
+    def find_all_emails_by_phone(self, phone, max_results=8, person_name=None, org_name=None):
         """Like find_email_by_phone, but returns every distinct email found
         across the search results instead of picking just one — used for the
         ZocDoc/NPI import flow, where the user wants everything a phone-number
-        search turns up, not just the single most-likely mailbox."""
+        search turns up, not just the single most-likely mailbox. Addresses the
+        results don't tie back to this provider are still discarded."""
         if not phone:
             return []
-        return self._search_for_all_emails(f'"{phone}" email contact', max_results=max_results)
+        return self._search_for_all_emails(f'"{phone}" email contact',
+                                            max_results=max_results,
+                                            person_name=person_name,
+                                            org_name=org_name, phone=phone)
 
-    def find_all_emails_by_name(self, full_name, city="", state="", max_results=8):
+    def find_all_emails_by_name(self, full_name, city="", state="", max_results=8,
+                                org_name=None):
         """Fallback for find_all_emails_by_phone when the phone search turns up
         nothing: search the provider's full name instead, the way a person
         would type it into a browser after a phone search comes up empty."""
         if not full_name:
             return []
         query = f'"{full_name}" {city} {state} email contact'.strip()
-        return self._search_for_all_emails(query, max_results=max_results)
+        return self._search_for_all_emails(query, max_results=max_results,
+                                            person_name=full_name, org_name=org_name)
 
-    def _search_for_all_emails(self, query, max_results=8):
+    def _search_for_all_emails(self, query, max_results=8, person_name=None,
+                                org_name=None, phone=None):
         self._throttle()
         emails = set()
         try:
@@ -382,8 +635,14 @@ class EmailEngine:
                 for r in results:
                     body = r.get('body', '')
                     for e in re.findall(self.EMAIL_REGEX, body):
-                        if self._is_valid_email(e):
-                            emails.add(e)
+                        if not self._is_valid_email(e):
+                            continue
+                        if not self._result_corroborates(r, e, person_name, org_name, phone):
+                            self.logger.debug(
+                                f"Discarding {e}: nothing in the search result ties "
+                                f"it to {person_name or org_name or 'this provider'}.")
+                            continue
+                        emails.add(e)
             self._report_outcome(rate_limited=False)
         except Exception as e:
             self.logger.error(f"Error searching for all emails: {e}")
@@ -397,8 +656,9 @@ class EmailEngine:
                 results = ddgs.text(query, max_results=5)
                 for r in results:
                     url = r.get('href', '')
-                    # Filter out common non-practice sites
-                    if any(x in url.lower() for x in ["nppes", "npiregistry", "yelp", "facebook", "linkedin", "healthgrades", "vitals", "doximity"]):
+                    # Filter out directories and aggregators, which outrank the
+                    # practice's own site for almost every provider name.
+                    if any(x in url.lower() for x in self.DIRECTORY_DOMAINS):
                         continue
                     self._report_outcome(rate_limited=False)
                     return url
@@ -584,7 +844,8 @@ class EmailEngine:
                     # Without this, "Jane Smith is a therapist here. Our founder,
                     # Bob Jones, ..." would tag Jane as the founder.
                     between = text[min(m.end(), t_end):max(m.start(), t_start)]
-                    if re.search(r'[.!?;|•]\s', between) or len(between) > self.ROLE_CONTEXT_CHARS:
+                    if re.search(r'[.!?;|•]\s', self._strip_abbreviations(between)) \
+                            or len(between) > self.ROLE_CONTEXT_CHARS:
                         continue
                     return label
 
@@ -668,14 +929,16 @@ class EmailEngine:
         counts = Counter(phones)
         return sorted(set(phones), key=lambda p: (cls.is_tollfree(p), -counts[p], p))[0]
 
-    def _search_for_email_directly(self, query):
+    def _search_for_email_directly(self, query, person_name=None, org_name=None, phone=None):
         self._throttle()
         try:
             with DDGS() as ddgs:
                 results = ddgs.text(query, max_results=5)
                 for r in results:
                     body = r.get('body', '')
-                    found = [e for e in re.findall(self.EMAIL_REGEX, body) if self._is_valid_email(e)]
+                    found = [e for e in re.findall(self.EMAIL_REGEX, body)
+                             if self._is_valid_email(e)
+                             and self._result_corroborates(r, e, person_name, org_name, phone)]
                     if found:
                         self._report_outcome(rate_limited=False)
                         return self._pick_best_email(set(found))

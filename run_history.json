@@ -222,5 +222,47 @@
     "total": 0,
     "with_email": 0,
     "hit_rate": 0.0
+  },
+  {
+    "timestamp": "2026-08-21T09:23:08",
+    "action": "zocdoc_import",
+    "total": 392,
+    "with_email": 117,
+    "hit_rate": 29.8
+  },
+  {
+    "timestamp": "2026-08-21T09:52:35",
+    "action": "email_find",
+    "total": 392,
+    "with_email": 148,
+    "hit_rate": 37.8
+  },
+  {
+    "timestamp": "2026-08-21T15:22:32",
+    "action": "zocdoc_import",
+    "total": 393,
+    "with_email": 148,
+    "hit_rate": 37.7
+  },
+  {
+    "timestamp": "2026-08-21T15:49:40",
+    "action": "email_find",
+    "total": 393,
+    "with_email": 155,
+    "hit_rate": 39.4
+  },
+  {
+    "timestamp": "2026-08-24T16:31:14",
+    "action": "zocdoc_import",
+    "total": 403,
+    "with_email": 160,
+    "hit_rate": 39.7
+  },
+  {
+    "timestamp": "2026-09-10T21:49:16",
+    "action": "pt_collect",
+    "total": 534,
+    "with_email": 274,
+    "hit_rate": 51.3
   }
 ]

@@ -1,11 +1,27 @@
+# Core scraping and output
 requests
-openpyxl
 beautifulsoup4
 lxml
+openpyxl
 ddgs
+
+# Email verification: MX lookups. Without it the tool falls back to a plain
+# hostname check and reports addresses as "unknown" rather than "valid".
+dnspython
+
+# Google Sheets output (optional — only needed if you export to Sheets)
 gspread
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
 oauth2client
+
+# Analytics dashboard (optional)
 matplotlib
+
+# Outreach: stores the SMTP password in the OS credential store
+# (Windows Credential Manager / macOS Keychain) instead of a plain-text file.
+keyring
+
+# Tests
+pytest

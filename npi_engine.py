@@ -1,6 +1,8 @@
+import re
 import requests
 import time
 import logging
+from email_engine import EmailEngine
 
 class NPIEngine:
     BASE_URL = "https://npiregistry.cms.hhs.gov/api/"
@@ -13,7 +15,9 @@ class NPIEngine:
         Fetch providers from NPI Registry API with optional filters.
         state: 2-letter state abbreviation.
         specialty: Taxonomy description.
-        exclude_corp: If True, filters out organizations with corporate suffixes (Inc, Corp, LLC, etc.)
+        exclude_corp: If True, filters out organizations whose name carries a corporate
+        tag (Inc, Corp, Corporation, Incorporated). LLC/PLLC are deliberately kept —
+        most solo and small group practices register that way.
         min_updated_year: If specified (integer), filters out records last updated before this year.
         stop_event: Optional threading.Event; checked between pages so a long paginated
         fetch can be aborted mid-flight rather than only between (state, specialty) pairs.
@@ -70,7 +74,7 @@ class NPIEngine:
                 
             skip += limit
             if skip >= 1200: # API limit
-                self.logger.warning("Reached NPI API skip limit (1000). Cannot fetch more for this criteria.")
+                self.logger.warning("Reached the NPI API skip limit (1200). Cannot fetch more for this criteria.")
                 break
                 
             if max_records and len(all_providers) >= max_records:
@@ -207,7 +211,6 @@ class NPIEngine:
     def _is_corporate_entity(self, name):
         if not name:
             return False
-        import re
         # Clean special chars/punctuation and split into uppercase words
         cleaned = re.sub(r'[^\w\s]', ' ', name).upper()
         words = set(cleaned.split())
@@ -229,11 +232,37 @@ class NPIEngine:
                 else:
                     return None
 
+    @staticmethod
+    def _authorized_official(basic):
+        """An organization (NPI-2) record carries no first_name/last_name — the
+        person it names is the "authorized official", the one who registered the
+        organization, along with their title. That is the practice owner more
+        often than not ("Founder, CEO", "CEO", "Owner"), so it is both the only
+        name available for these records and the best decision-maker signal the
+        registry publishes. Ignoring it left every organization row in the sheet
+        with a blank provider name and a blank Role.
+
+        Returns (first_name, last_name, role) with role normalized to the same
+        vocabulary EmailEngine uses, or "" when the title isn't an ownership one.
+        """
+        first = basic.get("authorized_official_first_name", "") or ""
+        last = basic.get("authorized_official_last_name", "") or ""
+        title = basic.get("authorized_official_title_or_position", "") or ""
+        role = ""
+        for pattern, label in EmailEngine.OWNER_TITLE_PATTERNS:
+            if re.search(pattern, title, re.IGNORECASE):
+                role = label
+                # Titles read "Founder, CEO" — the first match wins, but an
+                # ownership title always beats a mere directorship.
+                if EmailEngine.is_ownership_role(label):
+                    break
+        return first, last, role
+
     def _parse_provider(self, entry):
         basic = entry.get("basic", {})
         addresses = entry.get("addresses", [])
         taxonomies = entry.get("taxonomies", [])
-        
+
         # Primary address (usually the first one or type='LOCATION')
         address_info = {}
         for addr in addresses:
@@ -252,11 +281,18 @@ class NPIEngine:
         if not specialty and taxonomies:
             specialty = taxonomies[0].get("desc", "")
 
+        first_name = basic.get("first_name", "")
+        last_name = basic.get("last_name", "")
+        role = ""
+        if not first_name and not last_name:
+            first_name, last_name, role = self._authorized_official(basic)
+
         return {
             "NPI Number": entry.get("number"),
-            "Provider First Name": basic.get("first_name", ""),
-            "Provider Last Name": basic.get("last_name", ""),
+            "Provider First Name": first_name,
+            "Provider Last Name": last_name,
             "Organization Name": basic.get("organization_name", ""),
+            "Role": role,
             "Phone": address_info.get("telephone_number", ""),
             "Email": "", # To be filled by EmailEngine
             "Address": address_info.get("address_1", ""),
