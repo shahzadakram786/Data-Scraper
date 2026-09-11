@@ -12,6 +12,11 @@ python app.py          # desktop app
 python cli.py doctor   # check every source is working
 ```
 
+> **New here, or handing this to someone else?** Read **[GUIDE.md](GUIDE.md)** —
+> a step-by-step walkthrough of setup, collecting, enriching, reading the
+> output, and sending. This README is the reference for how it works; the guide
+> is how to use it.
+
 ---
 
 ## What it does
