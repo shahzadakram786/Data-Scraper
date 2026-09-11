@@ -12,6 +12,7 @@ import pytest
 from conftest import fixture
 from errors import ListingParseError, RegionBlockedError, SourceUnavailableError
 from storage import RUN_OK, RUN_EMPTY, RUN_FAILED, RUN_STOPPED
+from email_engine import EmailEngine
 from pipeline import LeadPipeline, Reporter
 
 
@@ -60,27 +61,22 @@ class FakeEmailEngine:
 
     @staticmethod
     def is_valid_phone(phone):
-        from email_engine import EmailEngine
         return EmailEngine.is_valid_phone(phone)
 
     @staticmethod
     def is_tollfree(phone):
-        from email_engine import EmailEngine
         return EmailEngine.is_tollfree(phone)
 
     @staticmethod
     def is_ownership_role(role):
-        from email_engine import EmailEngine
         return EmailEngine.is_ownership_role(role)
 
     @staticmethod
     def is_platform_site(url):
-        from email_engine import EmailEngine
         return EmailEngine.is_platform_site(url)
 
     @staticmethod
     def _registrable_domain(netloc):
-        from email_engine import EmailEngine
         return EmailEngine._registrable_domain(netloc)
 
 

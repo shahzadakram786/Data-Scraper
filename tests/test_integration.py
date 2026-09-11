@@ -11,6 +11,7 @@ Everything external is faked. The point is the wiring, not the internet.
 import pytest
 
 import storage
+from email_engine import EmailEngine
 import outreach
 from storage import LeadStore, RUN_OK
 from pipeline import LeadPipeline, Reporter
@@ -69,27 +70,22 @@ class FakeEmailEngine:
 
     @staticmethod
     def is_valid_phone(phone):
-        from email_engine import EmailEngine
         return EmailEngine.is_valid_phone(phone)
 
     @staticmethod
     def is_tollfree(phone):
-        from email_engine import EmailEngine
         return EmailEngine.is_tollfree(phone)
 
     @staticmethod
     def is_ownership_role(role):
-        from email_engine import EmailEngine
         return EmailEngine.is_ownership_role(role)
 
     @staticmethod
     def is_platform_site(url):
-        from email_engine import EmailEngine
         return EmailEngine.is_platform_site(url)
 
     @staticmethod
     def _registrable_domain(netloc):
-        from email_engine import EmailEngine
         return EmailEngine._registrable_domain(netloc)
 
 

@@ -20,22 +20,28 @@ import pytest
 tkinter = pytest.importorskip("tkinter")
 
 
-def _display_available():
+@pytest.fixture(scope="session")
+def tk_root():
+    """The one Tk root for the whole session, as the real app has.
+
+    Tk must be started exactly once per process. Creating a root, destroying
+    it, and creating another corrupts Tcl's interpreter state on Windows — the
+    second one cannot even find init.tcl. That rules out both a root per test
+    and the obvious "can I open a display?" probe, since the probe itself would
+    be the first create/destroy cycle. So this fixture is the probe: if Tk will
+    not start, every test in the file skips.
+    """
     try:
         root = tkinter.Tk()
-    except Exception:
-        return False
+    except Exception as e:                     # no display, no Tcl, headless CI
+        pytest.skip("Tk is unavailable here: {0}".format(e))
+    root.withdraw()
+    yield root
     root.destroy()
-    return True
-
-
-pytestmark = pytest.mark.skipif(
-    not _display_available(),
-    reason="no display available for Tk")
 
 
 @pytest.fixture
-def gui(tmp_path, monkeypatch):
+def gui(tmp_path, monkeypatch, tk_root):
     """A fully built window pointed at a throwaway database.
 
     config is redirected first so the app can never touch the user's real
@@ -52,7 +58,8 @@ def gui(tmp_path, monkeypatch):
 
     import app as app_module
 
-    root = tkinter.Tk()
+    # Each test gets its own window inside the shared root.
+    root = tkinter.Toplevel(tk_root)
     root.withdraw()
     window = app_module.LeadGenApp(root)
 
@@ -64,6 +71,17 @@ def gui(tmp_path, monkeypatch):
         time.sleep(0.02)
 
     yield window
+
+    # Detach the log handlers before tearing the window down. The pane handler
+    # re-arms itself on a timer, and a handler left attached to a destroyed
+    # widget is exactly the leak the guard in TextHandler._drain exists for —
+    # closing them here keeps one test's window out of the next one's.
+    for handler in list(window.logger.handlers):
+        window.logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
     root.destroy()
 
 

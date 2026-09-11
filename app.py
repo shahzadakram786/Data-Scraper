@@ -29,6 +29,18 @@ import health
 import storage
 import outreach
 import verification
+# Imported here rather than inside _build_pipeline. These used to be loaded
+# lazily on a worker thread, and a module import running on a worker while the
+# main thread imports something else can deadlock the interpreter's import
+# machinery — a hang with no traceback, which is the worst kind. Loading them
+# up front costs a few hundred milliseconds once, at startup, on the main
+# thread. matplotlib stays lazy: it is only needed for the dashboard.
+from npi_engine import NPIEngine
+from email_engine import EmailEngine
+from psychology_today_engine import PsychologyTodayEngine
+from cms_engine import CMSEngine
+from verification import EmailVerifier
+from lead_manager import ExcelExporter, GoogleSheetsExporter
 from storage import LeadStore, RUN_OK, RUN_EMPTY, RUN_STOPPED, RUN_FAILED
 from pipeline import LeadPipeline, Reporter
 
@@ -65,6 +77,7 @@ class TextHandler(logging.Handler):
         super().__init__()
         self.widget = widget
         self.queue = queue.Queue()
+        self._stopped = False
         self.widget.after(120, self._drain)
 
     def emit(self, record):
@@ -73,13 +86,44 @@ class TextHandler(logging.Handler):
         except Exception:
             pass
 
+    def close(self):
+        """Stop the drain loop. Called when the window goes away."""
+        self._stopped = True
+        super().close()
+
     def _drain(self):
+        """Flush queued records into the pane, then schedule the next pass.
+
+        The reschedule has to stop when the widget is destroyed. This loop
+        re-arms itself every 120ms forever, so without the guard a closed
+        window leaves callbacks firing at a widget that no longer exists —
+        which throws TclError on shutdown and, in a process that opens several
+        windows, leaves a stack of orphaned loops behind.
+        """
+        if self._stopped:
+            return
+        try:
+            if not self.widget.winfo_exists():
+                self._stopped = True
+                return
+        except tk.TclError:
+            self._stopped = True
+            return
+
         pending = []
         while True:
             try:
                 pending.append(self.queue.get_nowait())
             except queue.Empty:
                 break
+        try:
+            self._render(pending)
+            self.widget.after(120, self._drain)
+        except tk.TclError:
+            # The window was destroyed between the check above and now.
+            self._stopped = True
+
+    def _render(self, pending):
         if pending:
             self.widget.configure(state="normal")
             for message, level in pending:
@@ -92,7 +136,6 @@ class TextHandler(logging.Handler):
                 self.widget.delete("1.0", str(line_count - 3000) + ".0")
             self.widget.see(tk.END)
             self.widget.configure(state="disabled")
-        self.widget.after(120, self._drain)
 
 
 class StatusBanner(tk.Frame):
@@ -1157,12 +1200,6 @@ class LeadGenApp:
     def _build_pipeline(self):
         """Fresh engines each run, so a proxy or worker change takes effect
         without restarting the app."""
-        from npi_engine import NPIEngine
-        from email_engine import EmailEngine
-        from psychology_today_engine import PsychologyTodayEngine
-        from verification import EmailVerifier
-        from cms_engine import CMSEngine
-
         self.save_settings_quietly()
         verifier = None
         if self.settings.get("verify_emails"):
@@ -1322,7 +1359,6 @@ class LeadGenApp:
         call_list = int(self.call_list_var.get() or 0)
         icp_only = self.icp_only_var.get()
         if self.settings.get("output") == "google":
-            from lead_manager import GoogleSheetsExporter
             credentials = self.settings.get("google_credentials")
             if not credentials or not os.path.exists(credentials):
                 raise RuntimeError("Select a valid Google service-account JSON file "
@@ -1331,7 +1367,6 @@ class LeadGenApp:
                                             self.settings.get("google_spreadsheet"),
                                             logger=self.logger)
         else:
-            from lead_manager import ExcelExporter
             exporter = ExcelExporter(self.settings.get("excel_path"), logger=self.logger)
             return exporter.export(self.store, min_score=min_score,
                                    call_list=call_list, call_list_icp=icp_only)
@@ -1483,7 +1518,6 @@ class LeadGenApp:
     def open_result(self):
         try:
             if self.settings.get("output") == "google":
-                from lead_manager import GoogleSheetsExporter
                 exporter = GoogleSheetsExporter(
                     self.settings.get("google_credentials"),
                     self.settings.get("google_spreadsheet"), logger=self.logger)

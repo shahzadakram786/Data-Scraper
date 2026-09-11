@@ -22,10 +22,19 @@ import argparse
 
 import config
 import catalog
+import outreach
 import health
 import storage
 from storage import LeadStore, RUN_OK, RUN_EMPTY, RUN_STOPPED, RUN_FAILED
 from pipeline import LeadPipeline, Reporter
+# At module scope on purpose — see the note in app.py about importing modules
+# from worker threads.
+from npi_engine import NPIEngine
+from email_engine import EmailEngine
+from psychology_today_engine import PsychologyTodayEngine
+from cms_engine import CMSEngine
+from verification import EmailVerifier
+from lead_manager import ExcelExporter, GoogleSheetsExporter
 
 
 EXIT_OK, EXIT_FAILED, EXIT_EMPTY = 0, 1, 2
@@ -81,12 +90,6 @@ def build_logger(verbose=False):
 
 def build_pipeline(settings, logger, reporter):
     """Wire up the store, engines and verifier from settings."""
-    from npi_engine import NPIEngine
-    from email_engine import EmailEngine
-    from psychology_today_engine import PsychologyTodayEngine
-    from verification import EmailVerifier
-    from cms_engine import CMSEngine
-
     store = LeadStore(settings["db_path"], logger=logger)
     migrate_if_needed(store, settings, logger)
 
@@ -134,7 +137,6 @@ def export(store, settings, logger, min_score=None, statuses=None,
            call_list=100, icp_only=False):
     """Render the database to whichever destination is configured."""
     if settings.get("output") == "google":
-        from lead_manager import GoogleSheetsExporter
         credentials = settings.get("google_credentials")
         if not credentials or not os.path.exists(credentials):
             logger.error("Google output is selected but the service-account "
@@ -144,7 +146,6 @@ def export(store, settings, logger, min_score=None, statuses=None,
                                         settings.get("google_spreadsheet"),
                                         logger=logger)
     else:
-        from lead_manager import ExcelExporter
         exporter = ExcelExporter(settings.get("excel_path"), logger=logger)
         return exporter.export(store, min_score=min_score, email_statuses=statuses,
                                call_list=call_list, call_list_icp=icp_only)
@@ -286,8 +287,6 @@ def cmd_enrich_cms(args, settings, logger):
 
 def cmd_send(args, settings, logger):
     """Send a campaign. Defaults to a dry run — you have to ask for a real one."""
-    import outreach
-
     try:
         with open(args.template, "r", encoding="utf-8") as handle:
             raw = handle.read()
