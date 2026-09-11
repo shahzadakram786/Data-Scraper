@@ -768,7 +768,7 @@ class LeadStore:
                  "verified_email": 0, "with_billing": 0, "phone_confirmed": 0,
                  "total_billing": 0.0, "avg_score": 0.0,
                  "by_state": {}, "by_specialty": {}, "by_source": {},
-                 "by_email_status": {}}
+                 "by_email_status": {}, "by_score_band": {}}
         with self._lock:
             conn = self._conn()
             row = conn.execute("""
@@ -827,6 +827,25 @@ class LeadStore:
                 GROUP BY status
             """):
                 stats["by_email_status"][r["status"]] = r["total"]
+
+            # Banded in SQL rather than by walking every lead in Python. The
+            # window redraws this on every screen change, and a full scan there
+            # costs most of a second once the database passes 20,000 leads.
+            row = conn.execute("""
+                SELECT
+                  SUM(CASE WHEN s >= 70 THEN 1 ELSE 0 END) AS high,
+                  SUM(CASE WHEN s >= 50 AND s < 70 THEN 1 ELSE 0 END) AS mid,
+                  SUM(CASE WHEN s >= 30 AND s < 50 THEN 1 ELSE 0 END) AS low,
+                  SUM(CASE WHEN s < 30 THEN 1 ELSE 0 END) AS poor
+                FROM (SELECT CAST(COALESCE(NULLIF(lead_score, ''), '0')
+                             AS INTEGER) AS s FROM leads)
+            """).fetchone()
+            stats["by_score_band"] = {
+                "70+": (row["high"] if row else 0) or 0,
+                "50-69": (row["mid"] if row else 0) or 0,
+                "30-49": (row["low"] if row else 0) or 0,
+                "under 30": (row["poor"] if row else 0) or 0,
+            }
         return stats
 
     # ---------------------------------------------------------- run history
