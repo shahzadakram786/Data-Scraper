@@ -1,0 +1,11 @@
+# Normalise line endings so the whole team sees the same diffs regardless of
+# platform. Without this, every file touched on Windows shows as fully rewritten.
+* text=auto eol=lf
+
+# Binary — never diff or convert these.
+*.xlsx binary
+*.ods  binary
+*.db   binary
+*.exe  binary
+*.png  binary
+*.ico  binary
