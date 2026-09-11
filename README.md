@@ -437,7 +437,7 @@ listing pages.
 pytest
 ```
 
-260 tests over saved copies of the real pages each parser has to handle. Every
+283 tests over saved copies of the real pages each parser has to handle. Every
 accuracy rule above has a test that fails if it regresses — which is what makes
 these heuristics safe to change. Previously the only way to find out you had
 broken the phone classifier was to run a whole state and read the output.
