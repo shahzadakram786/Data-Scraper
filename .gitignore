@@ -1,0 +1,34 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyInstaller build output
+build/
+dist/
+*.manifest
+
+# Scraped lead data — real provider contact details. These are working files,
+# not source, and must never be pushed to a public repo.
+*.xlsx
+*.ods
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+leads.db*
+
+# Local settings: proxy, Google service-account path, worker counts.
+config.json
+# Google service-account credentials
+*-service-account.json
+credentials.json
+
+# Run logs
+logs/
+*.log
+
+# Test/scratch
+.pytest_cache/
+.coverage
+htmlcov/
