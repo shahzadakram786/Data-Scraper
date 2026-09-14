@@ -61,6 +61,11 @@ DEFAULTS = {
     "send_batch": 25,
     "send_allow_unverified": False,
 
+    # Updates, offered from version tags on this GitHub repository. Checked when
+    # the app opens and every six hours; never installed without a click.
+    "check_updates": True,
+    "update_repo": "shahzadakram786/Data-Scraper",
+
     # Behaviour
     "resume_runs": True,               # pick up where a stopped run left off
     "owners_only": False,

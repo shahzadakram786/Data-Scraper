@@ -293,6 +293,31 @@ most common reason a first send fails.
 
 ---
 
+## Updates
+
+The app checks this repository's GitHub releases (or version tags) when it opens
+and every six hours, and shows **Update available** when there is a newer
+version. One click downloads it, test-starts the new version in a separate
+process, and restarts. It is never applied without a click, it waits for a
+running collection or send to finish, and a version that fails its start-up
+check is rolled back rather than kept.
+
+- **A git checkout** fast-forwards to the release tag, installs new libraries if
+  `requirements.txt` changed, and refuses rather than overwriting local edits.
+- **The Windows .exe** downloads the release's `ProviderLeadGen.exe`, verifies
+  it against `ProviderLeadGen.exe.sha256`, self-tests it, and swaps it in after
+  the running copy exits.
+
+The code is never swapped inside the running process — that is how a run ends
+up half on old code and half on new. Updating is a restart of a few seconds;
+leads, settings and passwords live outside the code and are untouched.
+
+`python cli.py update --check` checks from the command line; `python cli.py
+update` applies it. Publishing an update is `version.py` + a `vX.Y.Z` tag — see
+[GUIDE.md](GUIDE.md), section 10.
+
+---
+
 ## When something breaks, it says so
 
 Every source here can change or block us without notice. Previously that showed

@@ -142,6 +142,12 @@ def install(root):
               foreground=[("disabled", INK_FAINT)])
     style.configure("Ghost.TButton", font=F_SMALL, padding=(10, 6))
     style.configure("Step.TButton", font=(FONT, 9, "bold"), padding=(14, 7))
+    # The one button that appears only when something is waiting for you, so
+    # it carries the "good news" colour rather than the brand navy.
+    style.configure("Update.TButton", font=(FONT, 9, "bold"), padding=(12, 6),
+                    background=OK, foreground="#ffffff", borderwidth=0)
+    style.map("Update.TButton", background=[("active", "#256628")],
+              foreground=[("disabled", INK_FAINT)])
 
     style.configure("TEntry", fieldbackground=SURFACE, borderwidth=1, padding=5)
     style.configure("TCombobox", fieldbackground=SURFACE, borderwidth=1, padding=4)

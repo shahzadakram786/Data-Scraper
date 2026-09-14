@@ -459,3 +459,83 @@ class TestResponsiveness:
         assert thread is not threading.main_thread()
         assert options["call_list"] == 250
         assert options["icp_only"] is True
+
+
+class _AliveWorker:
+    """Stands in for a run in progress."""
+
+    def is_alive(self):
+        return True
+
+
+class TestUpdates:
+    """The update button is the one piece of UI that must stay out of the way
+    until it matters, and must never interrupt a run."""
+
+    @staticmethod
+    def _release(version="9.0.0"):
+        import updater
+        return updater.UpdateInfo(version, "v" + version, notes="Faster exports.")
+
+    def test_there_is_no_update_button_until_an_update_exists(self, gui):
+        assert gui.available_update is None
+        assert not gui.update_btn.winfo_manager()
+
+    def test_a_found_update_shows_the_button_with_its_version(self, gui):
+        gui._on_update_checked(self._release(), None, False)
+        gui.root.update()
+        assert gui.available_update.version == "9.0.0"
+        assert gui.update_btn.winfo_manager()
+        assert "9.0.0" in gui.update_btn.cget("text")
+
+    def test_checking_by_hand_says_when_you_are_up_to_date(self, gui):
+        from version import __version__
+        gui._on_update_checked(None, None, True)
+        assert __version__ in gui.banner.title.cget("text") + gui.banner.detail.cget("text")
+
+    def test_a_failed_background_check_stays_quiet(self, gui):
+        """Being offline for a moment is not worth an alarm on screen."""
+        gui.banner.set("idle", "Ready.")
+        gui._on_update_checked(None, "Could not reach GitHub.", False)
+        assert gui.banner.title.cget("text") == "Ready."
+
+    def test_a_failed_check_you_asked_for_is_explained(self, gui):
+        gui._on_update_checked(None, "Could not reach GitHub.", True)
+        assert "Could not reach GitHub." in gui.banner.detail.cget("text")
+
+    def test_an_update_waits_for_a_running_job(self, gui, monkeypatch):
+        """Restarting in the middle of a collection or a send would lose work."""
+        import tkinter.messagebox as messagebox
+        monkeypatch.setattr(messagebox, "askyesno",
+                            lambda *a, **k: pytest.fail("must not ask mid-run"))
+        release = self._release()
+        gui.worker = _AliveWorker()
+        try:
+            gui.apply_update(release)
+        finally:
+            gui.worker = None
+        assert gui._update_after_run is release
+        assert "finish" in (gui.banner.title.cget("text")
+                            + gui.banner.detail.cget("text")).lower()
+
+    def test_the_window_opened_by_an_update_says_it_worked(self, gui):
+        from version import __version__
+        gui._announce_updated("1.9.0")
+        text = gui.banner.title.cget("text") + gui.banner.detail.cget("text")
+        assert "1.9.0" in text and __version__ in text
+
+    def test_turning_off_automatic_checks_is_saved(self, gui):
+        gui.check_updates_var.set(False)
+        gui.save_settings()
+        assert gui.settings["check_updates"] is False
+
+    def test_the_selfcheck_starts_and_exits_without_opening_a_window(self):
+        """What the .exe updater runs on a new build before trusting it."""
+        import os
+        import subprocess
+        import sys
+        project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        result = subprocess.run([sys.executable, "app.py", "--selfcheck"],
+                                cwd=project, capture_output=True, text=True,
+                                timeout=180)
+        assert result.returncode == 0, result.stderr

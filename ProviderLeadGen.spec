@@ -28,6 +28,8 @@ a = Analysis(
         'http_pool',
         'ui_theme',
         'ui_help',
+        'updater',
+        'version',
         'health',
         'errors',
         'config',

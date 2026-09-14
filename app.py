@@ -33,6 +33,8 @@ import outreach
 import verification
 import ui_help
 import ui_theme as T
+import updater
+from version import __version__
 from storage import LeadStore, RUN_OK, RUN_EMPTY, RUN_STOPPED, RUN_FAILED
 from pipeline import LeadPipeline, Reporter
 # Imported at module scope on purpose. These used to load lazily on a worker
@@ -197,9 +199,14 @@ class LeadGenApp:
         "would you be open to a short call this week?\n\n"
         "If not, no problem at all - just say so and I won't follow up.")
 
-    def __init__(self, root):
+    def __init__(self, root, updated_from=None):
         self.root = root
         self.root.title(self.WINDOW_TITLE)
+        # Set when an update started this window, so the first thing it says is
+        # whether the update worked.
+        self.updated_from = updated_from
+        self.available_update = None     # an updater.UpdateInfo, once one is found
+        self._update_after_run = None    # an update waiting for a run to finish
         self.root.geometry("1180x860")
         self.root.minsize(1000, 720)
 
@@ -376,6 +383,12 @@ class LeadGenApp:
 
         buttons = tk.Frame(bar, bg=T.GROUND)
         buttons.pack(side=tk.RIGHT)
+        # Created now, shown only once an update exists — see _on_update_checked.
+        # A permanent "Check for updates" button would be one more thing to
+        # ignore; this appears when there is something to act on.
+        self.update_btn = ttk.Button(buttons, text="Update available",
+                                     style="Update.TButton",
+                                     command=self.show_update_dialog)
         self.help_btn = ttk.Button(buttons, text="Guide", style="Ghost.TButton",
                                    command=self.toggle_help)
         self.help_btn.pack(side=tk.RIGHT, padx=(6, 0))
@@ -1263,6 +1276,31 @@ class LeadGenApp:
                            "emits hundreds of cold emails is blacklisted in a day.",
                  font=T.F_SMALL, bg=T.SURFACE, fg=T.INK_FAINT).pack(side=tk.LEFT)
 
+        # --- updates
+        card = T.Card(page, padding=18)
+        card.pack(fill=tk.X, pady=(0, 12))
+        self._card_title(card.inner, "UPDATES")
+        row = tk.Frame(card.inner, bg=T.SURFACE)
+        row.pack(fill=tk.X)
+        self.version_label = tk.Label(
+            row, text="You are running version {0}.".format(__version__),
+            font=T.F_BODY, bg=T.SURFACE, fg=T.INK, anchor="w")
+        self.version_label.pack(side=tk.LEFT)
+        ttk.Button(row, text="Check now", style="Ghost.TButton",
+                   command=lambda: self.check_for_updates(user_initiated=True)
+                   ).pack(side=tk.RIGHT)
+        self.check_updates_var = tk.BooleanVar(
+            value=self.settings.get("check_updates", True))
+        ttk.Checkbutton(card.inner,
+                        text="Check for updates when the app opens and every six hours",
+                        variable=self.check_updates_var).pack(anchor="w", pady=(10, 0))
+        tk.Label(card.inner,
+                 text="Updates are never installed without you pressing Update. "
+                      "Your leads, settings and saved password are not part of an "
+                      "update and are left untouched.",
+                 font=T.F_SMALL, bg=T.SURFACE, fg=T.INK_FAINT, anchor="w",
+                 justify="left", wraplength=700).pack(fill=tk.X, pady=(4, 0))
+
         self._sync_output()
         self._apply_smtp_preset(initial=True)
         return outer
@@ -1329,6 +1367,7 @@ class LeadGenApp:
             "postal_address": self.postal_var.get().strip(),
             "unsubscribe_email": self.unsub_var.get().strip(),
             "daily_send_cap": int(self.daily_cap_var.get() or 40),
+            "check_updates": bool(self.check_updates_var.get()),
         })
         year = self.min_year_var.get()
         self.settings["min_updated_year"] = None if year == "No Filter" else int(year)
@@ -1405,6 +1444,14 @@ class LeadGenApp:
             self.banner.set("idle", "Ready.",
                             "Nothing collected yet. The Next step box below says "
                             "where to begin.")
+
+        if self.updated_from:
+            self._announce_updated(self.updated_from)
+
+        # The first check waits a few seconds so it never competes with the
+        # window coming up; _on_update_checked schedules the ones after it.
+        if self.settings.get("check_updates", True):
+            self.root.after(4000, self.check_for_updates)
 
     def refresh(self, force=False):
         """Re-read everything from the database and redraw the screens.
@@ -1653,11 +1700,233 @@ class LeadGenApp:
         self.banner.set("busy", phase)
 
     def _end(self):
+        # The run is over. _end is posted from the worker's own finally block,
+        # so that thread is still unwinding when this executes; clearing the
+        # reference first means everything below that asks "is a run going?"
+        # gets the right answer. Without it the bottom button could keep a
+        # stale label, and an update waiting for this run would wait forever.
+        self.worker = None
         self.primary_btn.configure(state=tk.NORMAL)
         self.stop_btn.configure(state=tk.DISABLED)
         self._sync_primary()
         self.refresh(force=True)
         self._refresh_resume_hint()
+
+        pending, self._update_after_run = self._update_after_run, None
+        if pending is not None:
+            self.apply_update(pending)
+
+    # ===================================================================
+    # Updates
+    # ===================================================================
+
+    def check_for_updates(self, user_initiated=False):
+        """Ask GitHub on a background thread; the answer returns through the
+        UI queue. A background check that fails stays quiet — a moment offline
+        is not worth an alarm — but a check you asked for says what happened."""
+        if user_initiated:
+            self.banner.set("busy", "Checking for updates…")
+        repo = self.settings.get("update_repo") or updater.DEFAULT_REPO
+
+        def work():
+            info, error = None, None
+            try:
+                info = updater.check_for_update(repo=repo)
+            except updater.UpdateError as e:
+                error = str(e)
+            except Exception as e:      # a failed check must never take the app down
+                error = "The update check failed unexpectedly: {0}".format(e)
+            self.post(self._on_update_checked, info, error, user_initiated)
+
+        threading.Thread(target=work, daemon=True, name="update-check").start()
+
+    def _on_update_checked(self, info, error, user_initiated):
+        if not user_initiated and self.settings.get("check_updates", True):
+            self.root.after(updater.CHECK_INTERVAL_SECONDS * 1000,
+                            self.check_for_updates)
+
+        if error:
+            if user_initiated:
+                self.banner.set("warn", "Could not check for updates.", error)
+            else:
+                self.logger.debug("Background update check failed: %s", error)
+            return
+
+        if info is None:
+            if user_initiated:
+                self.banner.set("ok", "You are on the latest version ({0}).".format(
+                    __version__))
+            return
+
+        self.available_update = info
+        self.update_btn.configure(text="Update to {0}".format(info.version))
+        if not self.update_btn.winfo_manager():
+            self.update_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        # Never talk over a run that is reporting its progress.
+        if user_initiated or not (self.worker and self.worker.is_alive()):
+            self.banner.set(
+                "ok", "Version {0} is available.".format(info.version),
+                "You have {0}. Press “Update to {1}” at the top right to see what "
+                "changed.".format(__version__, info.version))
+
+    def _announce_updated(self, updated_from):
+        """The first thing a window started by an update says."""
+        if updated_from == __version__:
+            self.banner.set(
+                "warn", "The app restarted, but it is still version {0}.".format(
+                    __version__),
+                "The update may not have been applied. Settings → Updates → Check "
+                "now will offer it again.")
+            return
+        self.banner.set(
+            "ok", "Updated from {0} to {1}.".format(updated_from, __version__),
+            "Your leads, settings and saved password are exactly as you left them.")
+
+    def show_update_dialog(self):
+        info = self.available_update
+        if info is None:
+            self.check_for_updates(user_initiated=True)
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Update available")
+        window.geometry("580x480")
+        window.configure(bg=T.GROUND)
+        window.transient(self.root)
+        frame = tk.Frame(window, bg=T.GROUND)
+        frame.pack(fill=tk.BOTH, expand=True, padx=18, pady=18)
+
+        tk.Label(frame, text="Version {0} is available".format(info.version),
+                 font=T.F_TITLE, bg=T.GROUND, fg=T.INK, anchor="w").pack(fill=tk.X)
+        meta = "You have {0}.".format(__version__)
+        if info.published_at:
+            meta += "  Published {0}.".format(info.published_at)
+        tk.Label(frame, text=meta, font=T.F_SMALL, bg=T.GROUND, fg=T.INK_FAINT,
+                 anchor="w").pack(fill=tk.X, pady=(2, 12))
+
+        card = T.Card(frame, padding=14)
+        card.pack(fill=tk.BOTH, expand=True)
+        tk.Label(card.inner, text="WHAT'S NEW", font=(T.FONT, 7, "bold"),
+                 bg=T.SURFACE, fg=T.INK_FAINT, anchor="w").pack(fill=tk.X, pady=(0, 6))
+        notes = scrolledtext.ScrolledText(card.inner, height=10, wrap="word",
+                                          font=T.F_BODY, relief="flat",
+                                          borderwidth=0, background=T.SURFACE)
+        notes.insert("1.0", info.notes or
+                     "No release notes were published for this version.")
+        notes.configure(state="disabled")
+        notes.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(frame,
+                 text="The app downloads the update, checks that the new version "
+                      "starts, and reopens itself. If a collection or campaign is "
+                      "running, it waits for that to finish first.",
+                 font=T.F_SMALL, bg=T.GROUND, fg=T.INK_SOFT, anchor="w",
+                 justify="left", wraplength=540).pack(fill=tk.X, pady=(12, 10))
+
+        buttons = tk.Frame(frame, bg=T.GROUND)
+        buttons.pack(fill=tk.X)
+
+        def update_now():
+            window.destroy()
+            self.apply_update(info)
+
+        ttk.Button(buttons, text="Update and restart", style="Primary.TButton",
+                   command=update_now).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Later", command=window.destroy).pack(
+            side=tk.RIGHT, padx=8)
+        if info.url:
+            ttk.Button(buttons, text="View on GitHub", style="Ghost.TButton",
+                       command=lambda: webbrowser.open(info.url)).pack(side=tk.LEFT)
+
+    def apply_update(self, info=None):
+        """Download and verify the update on a worker, then restart into it.
+
+        Waits for a running collection or send rather than cutting it off — the
+        restart would lose whatever that run had in flight.
+        """
+        import sys
+
+        info = info or self.available_update
+        if info is None:
+            return
+        if self.worker and self.worker.is_alive():
+            self._update_after_run = info
+            self.banner.set(
+                "busy",
+                "Version {0} will be installed when this run finishes.".format(
+                    info.version),
+                "The app restarts itself afterwards. Nothing collected in the "
+                "meantime is lost.")
+            return
+
+        kind = updater.install_kind()
+        if kind == "unmanaged":
+            messagebox.showinfo(
+                "Update available",
+                "This copy of the app was not installed from GitHub, so it cannot "
+                "update itself. The download page will open instead.")
+            if info.url:
+                webbrowser.open(info.url)
+            return
+
+        def make_job():
+            logger = self.logger
+            if kind == "git":
+                def job():
+                    try:
+                        updater.apply_git_update(info, logger=logger)
+                    except updater.UpdateError as e:
+                        self.post(self._update_failed, info, str(e))
+                        return
+                    self.post(self._finish_update, info, None)
+                return job
+
+            exe_path = sys.executable
+            pid = os.getpid()
+
+            def job():
+                try:
+                    new_path = updater.apply_frozen_update(info, exe_path=exe_path,
+                                                           logger=logger)
+                    script = updater.write_swap_script(exe_path, new_path, pid,
+                                                       __version__)
+                except (updater.UpdateError, OSError) as e:
+                    self.post(self._update_failed, info, str(e))
+                    return
+                self.post(self._finish_update, info, script)
+            return job
+
+        self._spawn(make_job, "Downloading version {0}…".format(info.version))
+
+    def _update_failed(self, info, message):
+        self.banner.set("error", "Version {0} was not installed.".format(info.version),
+                        message)
+
+    def _finish_update(self, info, swap_script):
+        """Start the updated app, then close this window. By now the new version
+        is on disk and has passed its start-up check."""
+        self.banner.set("ok", "Version {0} is ready — restarting…".format(info.version))
+        self.root.update_idletasks()
+        try:
+            updater.restart(__version__, swap_script=swap_script)
+        except OSError as e:
+            self.banner.set(
+                "warn",
+                "Version {0} is installed, but the app could not restart itself."
+                .format(info.version),
+                "Close the app and open it again to use the new version. ({0})"
+                .format(e))
+            return
+        self.root.after(400, self._close_for_update)
+
+    def _close_for_update(self):
+        for handler in list(self.logger.handlers):
+            try:
+                handler.close()
+            except Exception:
+                pass
+        self._ui_closed = True
+        self.root.destroy()
 
     def stop_run(self):
         self.stop_event.set()
@@ -2393,7 +2662,34 @@ def _setup_file_logging(logger):
         return None
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description=LeadGenApp.WINDOW_TITLE)
+    parser.add_argument(
+        "--selfcheck", action="store_true",
+        help="Load everything the app needs, then exit without opening a window. "
+             "The updater runs a new build this way before trusting it.")
+    # Passed by the updater to the copy it restarts, so the new window can say
+    # which version it came from. Not something a person types.
+    parser.add_argument("--updated-from", help=argparse.SUPPRESS)
+    # parse_known_args: the packaged .exe has no console, so an unexpected
+    # argument must not become an error nobody can see.
+    args, _unknown = parser.parse_known_args(argv)
+
+    if args.selfcheck:
+        # Everything imported at the top of this module already loaded to reach
+        # this line. The exporters are the one piece deferred for startup speed,
+        # so load them too — a build missing openpyxl would otherwise pass this
+        # check and fail the first time someone exported.
+        _load_exporters()
+        return 0
+
     root = tk.Tk()
-    LeadGenApp(root)
+    LeadGenApp(root, updated_from=args.updated_from)
     root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -16,6 +16,7 @@ needed — the command line section at the end is optional.
 7. [A weekly routine that works](#7-a-weekly-routine-that-works)
 8. [When something goes wrong](#8-when-something-goes-wrong)
 9. [Running it from the command line](#9-running-it-from-the-command-line)
+10. [Updating](#10-updating)
 
 ---
 
@@ -419,3 +420,62 @@ the rest of the job from running — so the enrichment and export would silently
 never happen.
 
 Schedule it with Windows Task Scheduler, or `cron` on a server.
+
+---
+
+## 10. Updating
+
+The app checks GitHub for a newer version when it opens, and every six hours
+after that. It never installs anything without you pressing a button.
+
+### When an update is available
+
+1. A green **Update available** button appears at the top right.
+2. Press it to see the version number and what changed.
+3. Press **Update and restart**. The app downloads the update, checks that the
+   new version actually starts, and reopens itself — usually in under a minute.
+
+Your leads, settings and saved mail password are not part of the update, and
+are left exactly as they are.
+
+- **If a collection or campaign is running**, the update waits until it finishes.
+- **If the new version fails its start-up check**, the app keeps the version you
+  had and tells you why. Nothing is ever left half-installed.
+- **To check by hand:** Settings → Updates → **Check now**.
+
+### When it refuses to update
+
+| Message | What it means |
+| :--- | :--- |
+| "Some of the app's own files have been changed on this computer" | Someone edited the code in this folder. Updating would overwrite that, so it stops. Commit or undo the edits first. |
+| "This copy has its own commits that are not part of version X" | This copy's code has moved on separately. Whoever maintains it needs to merge the release by hand. |
+| "Its tag is not on GitHub yet" | The version was announced a moment before it finished publishing. Try again in a few minutes. |
+
+### Publishing an update (for whoever maintains the code)
+
+1. Raise the number in `version.py` — for example `2.0.0` → `2.1.0`.
+2. Commit it, then tag that commit with the same number and push both:
+
+   ```bash
+   git tag v2.1.0
+   git push origin HEAD --tags
+   ```
+
+3. **Recommended:** on GitHub, open the repository → Releases → *Draft a new
+   release*, choose the tag, and write what changed. That text is exactly what
+   users see before they update. Without a Release the update is still offered,
+   just with no notes.
+4. **For the Windows .exe:** build it with `pyinstaller ProviderLeadGen.spec`,
+   then attach two files to the Release — `ProviderLeadGen.exe` and
+   `ProviderLeadGen.exe.sha256`, a text file containing only its SHA-256:
+
+   ```bash
+   python -c "import hashlib;print(hashlib.sha256(open('dist/ProviderLeadGen.exe','rb').read()).hexdigest())" > dist/ProviderLeadGen.exe.sha256
+   ```
+
+   An .exe install refuses any download that does not match that checksum, and
+   cannot update at all if the two files are missing.
+
+> **Before you publish anything:** the repository is public. Pushing publishes
+> everything in it — including the provider contact data that is still
+> recoverable from its older commits. Decide how to handle that first.

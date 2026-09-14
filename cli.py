@@ -349,6 +349,45 @@ def cmd_suppress(args, settings, logger):
     return EXIT_OK
 
 
+def cmd_update(args, settings, logger):
+    """Check for, and unless --check is given apply, an update to this copy."""
+    # Imported here rather than at the top: this command runs alone on the
+    # main thread, before any worker pool exists, so a late import is safe.
+    import updater
+
+    repo = settings.get("update_repo") or updater.DEFAULT_REPO
+    try:
+        info = updater.check_for_update(repo=repo)
+    except updater.UpdateError as e:
+        logger.error(str(e))
+        return EXIT_FAILED
+
+    if info is None:
+        print("Up to date — version {0}.".format(updater.__version__))
+        return EXIT_OK
+
+    print("Version {0} is available (this copy is {1}).".format(
+        info.version, updater.__version__))
+    if info.notes:
+        print("\n" + info.notes + "\n")
+    if args.check:
+        return EXIT_OK
+
+    if updater.install_kind() != "git":
+        logger.error("Only a git checkout can update itself from the command "
+                     "line. Download version %s from %s", info.version,
+                     info.url or "GitHub")
+        return EXIT_FAILED
+    try:
+        updater.apply_git_update(info, logger=logger)
+    except updater.UpdateError as e:
+        logger.error(str(e))
+        return EXIT_FAILED
+    logger.info("Updated to version %s. Start the app again to use it.",
+                info.version)
+    return EXIT_OK
+
+
 def cmd_export(args, settings, logger):
     store = LeadStore(settings["db_path"], logger=logger)
     if args.excel:
@@ -510,6 +549,12 @@ def build_parser():
                             help="Only export these email statuses, comma separated "
                                  "(e.g. valid,role).")
     export_cmd.set_defaults(func=cmd_export)
+
+    update = subparsers.add_parser(
+        "update", help="Check for, and apply, an update to this copy.")
+    update.add_argument("--check", action="store_true",
+                        help="Only report whether an update is available.")
+    update.set_defaults(func=cmd_update)
 
     stats = subparsers.add_parser("stats", help="Show what is in the database.")
     stats.set_defaults(func=cmd_stats)
