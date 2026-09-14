@@ -92,6 +92,11 @@ def check_email_verification(logger=None):
     from verification import EmailVerifier
 
     report = {"source": "Email Verification", "ok": False, "steps": []}
+    # Runs remember what the network allowed last time, so they do not spend
+    # 11 seconds re-discovering it. A health check is the one moment that
+    # should look again from scratch — it is what you run after connecting a
+    # VPN, and a remembered "port 25 blocked" would hide that it now works.
+    EmailVerifier.forget_network_state()
     verifier = EmailVerifier(logger=logger)
 
     hosts = verifier._mx_for("gmail.com")

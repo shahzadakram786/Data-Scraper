@@ -42,6 +42,7 @@ import threading
 
 import requests
 
+import http_pool
 from errors import SourceUnavailableError
 
 
@@ -240,9 +241,11 @@ class CMSEngine:
 
     def _fetch_via_relay(self, url):
         try:
-            response = requests.get(self.RELAY_URL.format(url=url),
-                                    proxies=self.session.proxies or None,
-                                    timeout=self.RELAY_TIMEOUT)
+            # Pooled per worker: every lookup goes to the same reader host, and
+            # the handshake was a real share of the ~2 seconds each one took.
+            response = http_pool.session().get(self.RELAY_URL.format(url=url),
+                                               proxies=self.session.proxies or None,
+                                               timeout=self.RELAY_TIMEOUT)
             if response.status_code == 200:
                 return response.text
             self.logger.debug("CMS relay -> HTTP %s", response.status_code)

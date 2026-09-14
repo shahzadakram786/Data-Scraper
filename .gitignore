@@ -28,6 +28,9 @@ credentials.json
 logs/
 *.log
 
+# What this machine's network allows (DNS, port 25), remembered between runs.
+.cache/
+
 # Test/scratch
 .pytest_cache/
 .coverage

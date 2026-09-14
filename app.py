@@ -38,13 +38,17 @@ from pipeline import LeadPipeline, Reporter
 # Imported at module scope on purpose. These used to load lazily on a worker
 # thread, and a module import running on a worker while the main thread imports
 # something else can deadlock CPython's import machinery — a hang with no
-# traceback. matplotlib stays lazy: only the analytics window needs it.
+# traceback.
+#
+# Two deliberate exceptions, both still imported only on the main thread:
+# lead_manager, which drags in openpyxl and numpy for over a second of startup
+# and is only needed to write a spreadsheet (see _load_exporters, called before
+# any run's worker starts), and matplotlib, which only the analytics window uses.
 from npi_engine import NPIEngine
 from email_engine import EmailEngine
 from psychology_today_engine import PsychologyTodayEngine
 from cms_engine import CMSEngine
 from verification import EmailVerifier
-from lead_manager import ExcelExporter, GoogleSheetsExporter
 
 
 class TextHandler(logging.Handler):
@@ -157,14 +161,14 @@ class AppReporter(Reporter):
         self.app = app
 
     def progress(self, done, total):
-        self.app.root.after(0, self.app.set_progress, done, total)
+        self.app.post(self.app.set_progress, done, total)
 
     def counts(self, sheet_key, leads=0, emails=0):
-        self.app.root.after(0, self.app.bump_counts, sheet_key, leads, emails)
+        self.app.post(self.app.bump_counts, sheet_key, leads, emails)
 
     def phase(self, text):
         self.log(text)
-        self.app.root.after(0, lambda: self.app.banner.set("busy", text))
+        self.app.post(lambda: self.app.banner.set("busy", text))
 
 
 # The order the work actually happens in. The rail follows it, and so does the
@@ -210,11 +214,67 @@ class LeadGenApp:
         self.nav_buttons = {}
         self.help_open = False
         self._next_action = None
+        # The database fingerprint the screens were last drawn from. refresh()
+        # skips the redraw when it has not changed.
+        self._shown_version = None
 
         T.install(self.root)
         self._build()
         self._setup_logging()
+
+        # Work done on worker threads reaches the window only through this
+        # queue, which the Tk thread empties on its own timer. Workers used to
+        # call root.after() directly. That is itself a call into Tk, and it only
+        # works while the main thread is sitting inside mainloop: close the
+        # window mid-run, or drive the app without mainloop as the tests do,
+        # and it raises "main thread is not in main loop" and the update is lost.
+        self._ui_queue = queue.Queue()
+        self._ui_closed = False
+        self._pump_ui()
+
         self.root.after(50, self._startup)
+
+    UI_PUMP_MS = 50
+
+    def post(self, fn, *args):
+        """Run fn(*args) on the Tk thread soon. Safe to call from any thread —
+        it touches nothing but a queue."""
+        self._ui_queue.put((fn, args))
+
+    def _pump_ui(self):
+        """Run whatever the workers have posted, then check again shortly.
+
+        Stops for good once the window is gone, so a run that outlives its
+        window cannot keep calling into a destroyed Tk.
+        """
+        if self._ui_closed:
+            return
+        try:
+            if not self.root.winfo_exists():
+                self._ui_closed = True
+                return
+        except tk.TclError:
+            self._ui_closed = True
+            return
+
+        while True:
+            try:
+                fn, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except tk.TclError:
+                self._ui_closed = True     # destroyed while this was queued
+                return
+            except Exception:
+                logging.getLogger("LeadGen").error(
+                    "A window update failed:\n%s", traceback.format_exc())
+
+        try:
+            self.root.after(self.UI_PUMP_MS, self._pump_ui)
+        except tk.TclError:
+            self._ui_closed = True
 
     # ===================================================================
     # Chrome
@@ -1275,6 +1335,9 @@ class LeadGenApp:
         config.save(self.settings)
         self._save_smtp_password()
         self._refresh_compliance()
+        # The next-step recommendation depends on settings as well as data, so
+        # the next screen change must redraw even though the database is the same.
+        self._shown_version = None
         self.banner.set("ok", "Settings saved.",
                         "Stored in config.json and used by the command line too.")
 
@@ -1343,10 +1406,23 @@ class LeadGenApp:
                             "Nothing collected yet. The Next step box below says "
                             "where to begin.")
 
-    def refresh(self):
-        """Re-read everything from the database. Cheap — it is all indexed."""
+    def refresh(self, force=False):
+        """Re-read everything from the database and redraw the screens.
+
+        Skipped when nothing has changed since the last redraw. Every click in
+        the rail calls this, and rebuilding the charts, the tab table and the
+        recent-runs list for a database that had not changed was pure waiting.
+        force=True redraws regardless — used when a run ends.
+        """
         if not self.store:
             return
+        # Read the fingerprint before the data: a worker committing in between
+        # then shows up as a new version next time, instead of being missed.
+        version = self.store.data_version()
+        if not force and version == self._shown_version:
+            return
+        self._shown_version = version
+
         stats = self.store.get_stats()
         outreach_stats = self.store.outreach_stats()
 
@@ -1401,9 +1477,12 @@ class LeadGenApp:
             ("under 30", bands.get("under 30", 0), T.MUTED)])
 
         # --- enrich step states
-        missing = self.store.count(missing_email=True)
-        unverified = self.store.count(unverified=True)
-        needs_cms = self.store.count(needs_cms=True)
+        # One query for all three backlogs, handed to the next-step box below
+        # rather than counted a second time there.
+        pending = self.store.pending_counts()
+        missing = pending["missing_email"]
+        unverified = pending["unverified"]
+        needs_cms = pending["needs_cms"]
         self.step_find.set_state(
             "All leads have an address" if not missing
             else "{0} waiting".format(missing),
@@ -1440,17 +1519,18 @@ class LeadGenApp:
                      anchor="e").pack(side=tk.RIGHT)
 
         self._refresh_compliance()
-        self._refresh_next_action(stats, outreach_stats)
+        self._refresh_next_action(stats, outreach_stats, pending)
 
-    def _refresh_next_action(self, stats, outreach_stats):
+    def _refresh_next_action(self, stats, outreach_stats, pending=None):
         """Pick the one thing most worth doing, from the real state of the data.
 
         This is the answer to "I don't know what to do" — it names a stage that
         is actually unfinished rather than offering six equal choices.
         """
-        missing = self.store.count(missing_email=True)
-        unverified = self.store.count(unverified=True)
-        needs_cms = self.store.count(needs_cms=True)
+        pending = pending or self.store.pending_counts()
+        missing = pending["missing_email"]
+        unverified = pending["unverified"]
+        needs_cms = pending["needs_cms"]
         problems = outreach.compliance_problems(self.settings)
 
         if stats["total"] == 0:
@@ -1490,15 +1570,20 @@ class LeadGenApp:
         self.next_note.configure(text=note)
         self.nav_next.configure(text=title)
 
+    def _query_pipeline(self):
+        """A pipeline with no engines, for questions the database alone can
+        answer — who a campaign would reach — without building verifiers and
+        HTTP clients that nothing is going to use."""
+        return LeadPipeline(store=self.store, npi_engine=None, email_engine=None,
+                            pt_engine=None, reporter=Reporter(self.logger),
+                            settings=self.settings)
+
     def _recipients_preview(self):
-        """How many people a default campaign would reach. Never raises — this
-        runs on every refresh and must not be able to break the Home screen."""
+        """How many people a default campaign would reach. Never raises — it runs
+        on refresh and must not be able to break the Home screen."""
         try:
-            pipeline = LeadPipeline(store=self.store, npi_engine=None,
-                                    email_engine=None, pt_engine=None,
-                                    reporter=Reporter(self.logger),
-                                    settings=self.settings)
-            recipients, excluded = pipeline.recipients_for(limit=0, icp_only=True)
+            recipients, excluded = self._query_pipeline().recipients_for(
+                limit=0, icp_only=True)
             return len(recipients), excluded
         except Exception as e:
             self.logger.debug("Could not preview recipients: %s", e)
@@ -1571,7 +1656,7 @@ class LeadGenApp:
         self.primary_btn.configure(state=tk.NORMAL)
         self.stop_btn.configure(state=tk.DISABLED)
         self._sync_primary()
-        self.refresh()
+        self.refresh(force=True)
         self._refresh_resume_hint()
 
     def stop_run(self):
@@ -1579,13 +1664,29 @@ class LeadGenApp:
         self.stop_btn.configure(state=tk.DISABLED)
         self.logger.info("Stop requested — finishing the items already in flight…")
 
-    def _spawn(self, target, phase):
+    def _spawn(self, make_job, phase):
+        """Start a run.
+
+        make_job is called here, on the Tk thread, once this run's stop event
+        exists, and returns the function the worker executes. Everything that
+        reads the window — settings, text boxes, dropdowns — belongs in
+        make_job and never in the job itself. Tk is not thread-safe, and a
+        widget read from a worker shows up as an occasional frozen window
+        rather than as an error anyone can trace.
+        """
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Already running",
                                 "Wait for the current run to finish, or press Stop.")
             return
         self._begin(phase)
-        self.worker = threading.Thread(target=self._guarded, args=(target,),
+        try:
+            job = make_job()
+        except Exception as e:
+            self.logger.error("Could not start: %s\n%s", e, traceback.format_exc())
+            self._end()
+            self.banner.set("error", "Could not start.", str(e))
+            return
+        self.worker = threading.Thread(target=self._guarded, args=(job,),
                                        daemon=True)
         self.worker.start()
 
@@ -1594,14 +1695,20 @@ class LeadGenApp:
             target()
         except Exception as e:
             self.logger.error("Unexpected error: %s\n%s", e, traceback.format_exc())
-            self.root.after(0, lambda: self.banner.set(
+            self.post(lambda: self.banner.set(
                 "error", "The run stopped with an unexpected error.", str(e)))
         finally:
-            self.root.after(0, self._end)
+            self.post(self._end)
 
     def _build_pipeline(self):
-        """Fresh engines each run, so a proxy or worker change takes effect
-        without restarting the app."""
+        """Fresh engines for each run, so a proxy or worker change takes effect
+        without restarting the app.
+
+        Only ever called from a make_job, on the Tk thread. It saves the
+        settings form, which reads widgets, and it loads the exporters, which
+        must never be imported for the first time on a worker.
+        """
+        _load_exporters()
         self.save_settings_quietly()
         verifier = None
         if self.settings.get("verify_emails"):
@@ -1633,13 +1740,20 @@ class LeadGenApp:
             owners_only = self.owners_var.get()
             resume = self.resume_var.get()
 
-            def job():
+            def make_job():
                 pipeline = self._build_pipeline()
-                result = pipeline.collect_psychology_today(
-                    state_name, state_abbr, owners_only=owners_only, resume=resume)
-                self._after_run(pipeline, result, "Psychology Today — " + state_name)
+                export = self._export_options()
 
-            self._spawn(job, "Collecting from Psychology Today…")
+                def job():
+                    result = pipeline.collect_psychology_today(
+                        state_name, state_abbr, owners_only=owners_only,
+                        resume=resume)
+                    self._after_run(pipeline, result,
+                                    "Psychology Today — " + state_name,
+                                    export_options=export)
+                return job
+
+            self._spawn(make_job, "Collecting from Psychology Today…")
 
         elif source == "npi":
             state = self.npi_state_var.get()
@@ -1653,14 +1767,19 @@ class LeadGenApp:
             year = self.min_year_var.get()
             min_year = None if year == "No Filter" else int(year)
 
-            def job():
+            def make_job():
                 pipeline = self._build_pipeline()
-                result = pipeline.collect_npi(states, specialties,
-                                              exclude_corp=exclude_corp,
-                                              min_year=min_year)
-                self._after_run(pipeline, result, "NPI Registry")
+                export = self._export_options()
 
-            self._spawn(job, "Collecting from the NPI Registry…")
+                def job():
+                    result = pipeline.collect_npi(states, specialties,
+                                                  exclude_corp=exclude_corp,
+                                                  min_year=min_year)
+                    self._after_run(pipeline, result, "NPI Registry",
+                                    export_options=export)
+                return job
+
+            self._spawn(make_job, "Collecting from the NPI Registry…")
 
         else:
             numbers = LeadPipeline.extract_npi_numbers(
@@ -1670,52 +1789,91 @@ class LeadGenApp:
                                      "No NPI numbers were found in the pasted text.")
                 return
 
-            def job():
+            def make_job():
                 pipeline = self._build_pipeline()
-                result = pipeline.import_npis(numbers)
-                self._after_run(pipeline, result, "Pasted NPI numbers")
+                export = self._export_options()
 
-            self._spawn(job, "Looking up {0} NPI numbers…".format(len(numbers)))
+                def job():
+                    result = pipeline.import_npis(numbers)
+                    self._after_run(pipeline, result, "Pasted NPI numbers",
+                                    export_options=export)
+                return job
+
+            self._spawn(make_job, "Looking up {0} NPI numbers…".format(len(numbers)))
 
     def start_enrichment(self, mode):
         """mode: find | verify | cms | all."""
         recheck = self.recheck_var.get()
 
-        def job():
+        def make_job():
             pipeline = self._build_pipeline()
-            if mode in ("find", "all"):
-                self._after_run(pipeline, pipeline.find_missing_emails(),
-                                "Email discovery", quiet=(mode == "all"))
-            if mode in ("verify", "all"):
-                self.settings["verify_emails"] = True
-                self._after_run(pipeline, pipeline.verify_emails(recheck=recheck),
-                                "Email verification", quiet=(mode == "all"))
-            if mode in ("cms", "all"):
-                self._after_run(pipeline, pipeline.enrich_from_cms(recheck=recheck),
-                                "Medicare data", quiet=(mode == "all"))
-            if mode == "all":
-                self.root.after(0, lambda: self.banner.set(
-                    "ok", "All three enrichment passes finished.",
-                    "Check the Results screen for what changed."))
+            if mode in ("verify", "all") and pipeline.verifier is None:
+                # Asking for verification explicitly overrides the setting that
+                # turns it off during collection. Setting the flag after the
+                # pipeline was built, as this used to, changed nothing — the
+                # pass then reported that verification was not enabled.
+                pipeline.verifier = EmailVerifier(
+                    logger=self.logger,
+                    probe_smtp=self.settings.get("smtp_probe", True),
+                    probe_sender=self.settings.get("probe_sender", ""))
+            export = self._export_options()
+
+            def job():
+                # A single pass exports when it finishes. All three together
+                # export once at the end: writing the same workbook three times
+                # in a row was most of the wait after "Run All Three Passes".
+                per_pass_export = None if mode == "all" else export
+                quiet = (mode == "all")
+                added = 0
+                if mode in ("find", "all"):
+                    result = pipeline.find_missing_emails()
+                    added += result.added
+                    self._after_run(pipeline, result, "Email discovery",
+                                    quiet=quiet, export_options=per_pass_export)
+                if mode in ("verify", "all"):
+                    result = pipeline.verify_emails(recheck=recheck)
+                    added += result.added
+                    self._after_run(pipeline, result, "Email verification",
+                                    quiet=quiet, export_options=per_pass_export)
+                if mode in ("cms", "all"):
+                    result = pipeline.enrich_from_cms(recheck=recheck)
+                    added += result.added
+                    self._after_run(pipeline, result, "Medicare data",
+                                    quiet=quiet, export_options=per_pass_export)
+                if mode == "all":
+                    if added and self.settings.get("auto_export"):
+                        try:
+                            self._export(export)
+                        except Exception as e:
+                            self.logger.error("Export failed: %s", e)
+                    self.post(lambda: self.banner.set(
+                        "ok", "All three enrichment passes finished.",
+                        "Check the Results screen for what changed."))
+            return job
 
         phases = {"find": "Finding missing email addresses…",
                   "verify": "Verifying email addresses…",
                   "cms": "Looking up Medicare data…",
                   "all": "Running all three enrichment passes…"}
-        self._spawn(job, phases.get(mode, "Working…"))
+        self._spawn(make_job, phases.get(mode, "Working…"))
 
     def start_export(self):
         min_score = int(self.min_score_var.get() or 0) or None
 
-        def job():
-            self.root.after(0, lambda: self.banner.set("busy", "Exporting…"))
-            written = self._export(min_score=min_score)
-            self.root.after(0, lambda: self.banner.set(
-                "ok" if written else "warn",
-                "Exported {0} leads.".format(written) if written
-                else "Nothing matched the export filter.",
-                self._export_target()))
-        self._spawn(job, "Exporting…")
+        def make_job():
+            export = self._export_options(min_score)
+            target = self._export_target()
+
+            def job():
+                written = self._export(export)
+                self.post(lambda: self.banner.set(
+                    "ok" if written else "warn",
+                    "Exported {0} leads.".format(written) if written
+                    else "Nothing matched the export filter.",
+                    target))
+            return job
+
+        self._spawn(make_job, "Exporting…")
 
     # -------------------------------------------------------- run: send
 
@@ -1732,7 +1890,8 @@ class LeadGenApp:
                 messagebox.showerror("Not ready to send", "\n\n".join(problems))
                 self.show("settings")
                 return
-            recipients, _excluded = self._build_pipeline().recipients_for(
+            # A database question — no engines needed just to count recipients.
+            recipients, _excluded = self._query_pipeline().recipients_for(
                 limit=limit, allow_unverified=allow_unverified, **filters)
             if not recipients:
                 messagebox.showinfo(
@@ -1748,20 +1907,27 @@ class LeadGenApp:
                         len(recipients), self.settings.get("from_email"))):
                 return
 
-        def job():
+        def make_job():
             pipeline = self._build_pipeline()
-            result = pipeline.send_campaign(
-                subject, body, campaign="app", limit=limit,
-                daily_cap=int(self.settings.get("daily_send_cap", 40)),
-                allow_unverified=allow_unverified, dry_run=dry_run,
-                min_seconds=int(self.settings.get("send_min_seconds", 45)),
-                max_seconds=int(self.settings.get("send_max_seconds", 90)),
-                **filters)
-            self._after_run(pipeline, result, "Preview" if dry_run else "Outreach")
-            if dry_run:
-                self.root.after(0, self.toggle_log) if not self.log_open else None
+            export = self._export_options()
+            open_log = dry_run and not self.log_open
 
-        self._spawn(job, "Previewing…" if dry_run else "Sending…")
+            def job():
+                result = pipeline.send_campaign(
+                    subject, body, campaign="app", limit=limit,
+                    daily_cap=int(self.settings.get("daily_send_cap", 40)),
+                    allow_unverified=allow_unverified, dry_run=dry_run,
+                    min_seconds=int(self.settings.get("send_min_seconds", 45)),
+                    max_seconds=int(self.settings.get("send_max_seconds", 90)),
+                    **filters)
+                self._after_run(pipeline, result,
+                                "Preview" if dry_run else "Outreach",
+                                export_options=export)
+                if open_log:
+                    self.post(self.toggle_log)
+            return job
+
+        self._spawn(make_job, "Previewing…" if dry_run else "Sending…")
 
     def send_test(self):
         """One message to yourself, so you see exactly what lands."""
@@ -1777,40 +1943,53 @@ class LeadGenApp:
                                 "Collect some leads first, so the merge fields "
                                 "have something to fill in.")
             return
+        # Read the editor here, on the Tk thread. The job used to read these
+        # widgets from the worker.
+        subject = outreach.render(self.subject_var.get(), sample)
+        body = outreach.render(self.body_text.get("1.0", tk.END).strip(), sample)
 
-        def job():
-            sender = outreach.EmailSender(self.settings, logger=self.logger)
-            subject = outreach.render(self.subject_var.get(), sample)
-            body = outreach.render(self.body_text.get("1.0", tk.END).strip(), sample)
-            try:
-                ok, detail = sender.send(address, "[TEST] " + subject, body)
-            finally:
-                sender.close()
-            self.root.after(0, lambda: self.banner.set(
-                "ok" if ok else "error",
-                "Test sent to " + address if ok else "Test failed",
-                "Merge fields were filled from your top lead." if ok else detail))
+        def make_job():
+            def job():
+                sender = outreach.EmailSender(self.settings, logger=self.logger)
+                try:
+                    ok, detail = sender.send(address, "[TEST] " + subject, body)
+                finally:
+                    sender.close()
+                self.post(lambda: self.banner.set(
+                    "ok" if ok else "error",
+                    "Test sent to " + address if ok else "Test failed",
+                    "Merge fields were filled from your top lead." if ok else detail))
+            return job
 
-        self._spawn(job, "Sending a test to yourself…")
+        self._spawn(make_job, "Sending a test to yourself…")
 
     def test_smtp(self):
-        def job():
-            ok, detail = outreach.EmailSender(
-                self.settings, logger=self.logger).verify_login()
-            self.root.after(0, lambda: self.banner.set(
-                "ok" if ok else "error",
-                "Mail server connection works." if ok else "Could not sign in.",
-                detail))
-        self._spawn(job, "Testing the mail server connection…")
+        def make_job():
+            def job():
+                ok, detail = outreach.EmailSender(
+                    self.settings, logger=self.logger).verify_login()
+                self.post(lambda: self.banner.set(
+                    "ok" if ok else "error",
+                    "Mail server connection works." if ok else "Could not sign in.",
+                    detail))
+            return job
+
+        self._spawn(make_job, "Testing the mail server connection…")
 
     # ------------------------------------------------------- run: after
 
-    def _after_run(self, pipeline, result, label, quiet=False):
+    def _after_run(self, pipeline, result, label, quiet=False, export_options=None):
         """Report the outcome honestly — including the outcomes that are not
-        failures but are not successes either."""
-        if self.settings.get("auto_export") and result.added:
+        failures but are not successes either.
+
+        Runs on the worker. export_options is the snapshot taken by
+        _export_options before the run started; pass None to skip exporting
+        here, as the three-pass enrichment does so it can export once at the end.
+        """
+        if export_options is not None and self.settings.get("auto_export") \
+                and result.added:
             try:
-                self._export()
+                self._export(export_options)
             except Exception as e:
                 self.logger.error("Export failed: %s", e)
 
@@ -1837,28 +2016,46 @@ class LeadGenApp:
                 self.banner.set(
                     "ok", "{0}: {1} new.".format(label, result.added),
                     result.message or self._export_target())
-        self.root.after(0, show)
+        self.post(show)
 
     def _export_target(self):
         if self.settings.get("output") == "google":
             return "Written to Google Sheets."
         return "Written to " + os.path.abspath(self.settings.get("excel_path")) + "."
 
-    def _export(self, min_score=None):
-        call_list = int(self.call_list_var.get() or 0)
-        icp_only = self.icp_only_var.get()
+    def _export_options(self, min_score=None):
+        """Everything an export needs from the window, read now.
+
+        Call on the Tk thread, before a run starts. The export itself runs on
+        the worker and reads only this snapshot — it used to read the Call List
+        and ICP controls directly, from the worker, which Tk does not allow.
+        Loading the exporters here also keeps their first import on this thread.
+        """
+        return {
+            "min_score": min_score,
+            "call_list": int(self.call_list_var.get() or 0),
+            "icp_only": bool(self.icp_only_var.get()),
+            "exporters": _load_exporters(),
+        }
+
+    def _export(self, options):
+        """Write the spreadsheet from a snapshot taken by _export_options.
+        Safe to call from a worker: it touches no widgets."""
+        exporters = options["exporters"]
         if self.settings.get("output") == "google":
             credentials = self.settings.get("google_credentials")
             if not credentials or not os.path.exists(credentials):
                 raise RuntimeError("Select a valid Google service-account JSON "
                                    "file in Settings.")
-            exporter = GoogleSheetsExporter(credentials,
-                                            self.settings.get("google_spreadsheet"),
-                                            logger=self.logger)
-            return exporter.export(self.store, min_score=min_score)
-        exporter = ExcelExporter(self.settings.get("excel_path"), logger=self.logger)
-        return exporter.export(self.store, min_score=min_score,
-                               call_list=call_list, call_list_icp=icp_only)
+            exporter = exporters.GoogleSheetsExporter(
+                credentials, self.settings.get("google_spreadsheet"),
+                logger=self.logger)
+            return exporter.export(self.store, min_score=options["min_score"])
+        exporter = exporters.ExcelExporter(self.settings.get("excel_path"),
+                                           logger=self.logger)
+        return exporter.export(self.store, min_score=options["min_score"],
+                               call_list=options["call_list"],
+                               call_list_icp=options["icp_only"])
 
     # ===================================================================
     # Live updates during a run
@@ -1885,14 +2082,21 @@ class LeadGenApp:
     # ===================================================================
 
     def run_health_check(self):
-        def job():
-            self.root.after(0, lambda: self.banner.set(
-                "busy", "Checking every source…"))
-            reports = health.run_all(proxies=config.proxies_for(self.settings),
-                                     logger=self.logger,
-                                     state=self.pt_state_var.get())
-            self.root.after(0, lambda: self._show_health(reports))
-        self._spawn(job, "Running health check…")
+        def make_job():
+            # Read on the Tk thread; the job used to read this dropdown from
+            # the worker.
+            state = self.pt_state_var.get()
+            proxies = config.proxies_for(self.settings)
+
+            def job():
+                self.post(lambda: self.banner.set(
+                    "busy", "Checking every source…"))
+                reports = health.run_all(proxies=proxies, logger=self.logger,
+                                         state=state)
+                self.post(lambda: self._show_health(reports))
+            return job
+
+        self._spawn(make_job, "Running health check…")
 
     def _show_health(self, reports):
         failed = [r["source"] for r in reports if not r["ok"]]
@@ -2014,7 +2218,7 @@ class LeadGenApp:
     def open_result(self):
         try:
             if self.settings.get("output") == "google":
-                exporter = GoogleSheetsExporter(
+                exporter = _load_exporters().GoogleSheetsExporter(
                     self.settings.get("google_credentials"),
                     self.settings.get("google_spreadsheet"), logger=self.logger)
                 webbrowser.open(exporter.url)
@@ -2025,7 +2229,7 @@ class LeadGenApp:
                         "Not exported yet",
                         "The spreadsheet has not been written yet. Export it now?"):
                     return
-                self._export()
+                self._export(self._export_options())
             _open_in_default_app(os.path.abspath(path))
         except Exception as e:
             messagebox.showerror("Could not open", str(e))
@@ -2137,6 +2341,18 @@ class LeadGenApp:
         canvas = FigureCanvasTkAgg(figure, master=window)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+
+def _load_exporters():
+    """Import the spreadsheet exporters on first use.
+
+    Deferred because lead_manager pulls in openpyxl and numpy — over a second
+    of startup for something only an export needs. Every caller is a Tk
+    handler that runs before any worker is started, so this import always
+    happens on the main thread and never races another import.
+    """
+    import lead_manager
+    return lead_manager
 
 
 def _open_in_default_app(path):

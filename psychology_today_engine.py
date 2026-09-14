@@ -5,6 +5,7 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 
+import http_pool
 from errors import RegionBlockedError, ListingParseError, SourceUnavailableError
 
 
@@ -361,9 +362,11 @@ class PsychologyTodayEngine:
         reader. Asking for `x-respond-with: html` gets the fully rendered page
         back, JSON-LD included, so _parse_listing works on it unchanged."""
         try:
-            resp = requests.get(self.RELAY_URL.format(url=url),
-                                headers=self.RELAY_HEADERS,
-                                proxies=self.session.proxies or None, timeout=90)
+            # Pooled per worker: every relayed page goes to the same reader host.
+            resp = http_pool.session().get(self.RELAY_URL.format(url=url),
+                                           headers=self.RELAY_HEADERS,
+                                           proxies=self.session.proxies or None,
+                                           timeout=90)
             if resp.status_code == 200:
                 return resp.text
             self.logger.warning(f"Reader relay for {url} -> HTTP {resp.status_code}")

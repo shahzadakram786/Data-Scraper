@@ -330,6 +330,10 @@ connections do. It means:
 Psychology Today and Medicare lookups several times faster. Put it in
 **Settings → Proxy**.
 
+The app remembers what your network allows, so each run doesn't spend 11
+seconds checking it again. **After you connect a VPN, press Health Check** — it
+always tests from scratch. Otherwise the old answer is kept for up to two hours.
+
 ### "Psychology Today is unavailable in your region"
 
 It only serves the directory to US traffic. The app detects this and routes

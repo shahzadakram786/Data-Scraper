@@ -643,6 +643,30 @@ class LeadStore:
                 order_by, ", ".join(sorted(self.ORDERINGS)))
             order_by = None
         order_clause = self.ORDERINGS.get(order_by or "best", self.DEFAULT_ORDER)
+        where, params = self._filter_sql(
+            sheet_key=sheet_key, state=state, source=source,
+            missing_email=missing_email, has_email=has_email,
+            unverified=unverified, needs_cms=needs_cms, min_score=min_score,
+            email_statuses=email_statuses)
+
+        sql = "SELECT * FROM leads" + where + " ORDER BY " + order_clause
+        if limit:
+            sql += " LIMIT " + str(int(limit))
+
+        with self._lock:
+            rows = self._conn().execute(sql, params).fetchall()
+        for row in rows:
+            yield self.row_to_lead(row)
+
+    @staticmethod
+    def _filter_sql(sheet_key=None, state=None, source=None, missing_email=False,
+                    has_email=False, unverified=False, needs_cms=False,
+                    min_score=None, email_statuses=None):
+        """The WHERE clause for a set of lead filters, as (sql, params).
+
+        Shared by iter_leads, count and pending_counts, so listing leads and
+        counting them can never disagree about what a filter means.
+        """
         where, params = [], []
         if sheet_key:
             where.append("sheet_key = ?")
@@ -674,18 +698,7 @@ class LeadStore:
             placeholders = ", ".join("?" * len(email_statuses))
             where.append("email_status IN (" + placeholders + ")")
             params.extend(email_statuses)
-
-        sql = "SELECT * FROM leads"
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY " + order_clause
-        if limit:
-            sql += " LIMIT " + str(int(limit))
-
-        with self._lock:
-            rows = self._conn().execute(sql, params).fetchall()
-        for row in rows:
-            yield self.row_to_lead(row)
+        return ((" WHERE " + " AND ".join(where)) if where else ""), params
 
     def iter_best_leads(self, owners_only=False, require_email=False,
                         icp_only=False, max_practice_size=ICP_MAX_PRACTICE_SIZE,
@@ -756,7 +769,54 @@ class LeadStore:
         return [r["sheet_key"] for r in rows]
 
     def count(self, **filters):
-        return sum(1 for _ in self.iter_leads(**filters))
+        """How many leads match, counted by the database.
+
+        This used to build every matching lead as a dictionary just to count
+        them: 6.7 of the 7.2 seconds a screen refresh took at 20,000 leads, paid
+        again on every click in the window.
+        """
+        filters.pop("order_by", None)
+        filters.pop("limit", None)
+        where, params = self._filter_sql(**filters)
+        with self._lock:
+            row = self._conn().execute(
+                "SELECT COUNT(*) AS n FROM leads" + where, params).fetchone()
+        return row["n"] if row else 0
+
+    # The three enrichment backlogs, in the order the passes run.
+    PENDING_FILTERS = ("missing_email", "unverified", "needs_cms")
+
+    def pending_counts(self):
+        """What each enrichment pass still has to do, in a single query.
+
+        Built from the same _filter_sql the passes themselves select with, so
+        the number on a button is exactly the number of leads that button will
+        work through.
+        """
+        parts = []
+        for name in self.PENDING_FILTERS:
+            where, _params = self._filter_sql(**{name: True})
+            parts.append("SUM(CASE WHEN {0} THEN 1 ELSE 0 END) AS {1}".format(
+                where[len(" WHERE "):], name))
+        with self._lock:
+            row = self._conn().execute(
+                "SELECT " + ", ".join(parts) + " FROM leads").fetchone()
+        return {name: ((row[name] if row else 0) or 0) for name in self.PENDING_FILTERS}
+
+    def data_version(self):
+        """A fingerprint that changes whenever anything in the database does.
+
+        The window compares this before redrawing, so clicking between screens
+        with nothing new to show costs nothing. Two parts, because each covers
+        what the other misses: SQLite's data_version moves when another
+        connection commits (the worker threads each have their own), and
+        total_changes counts writes made on this thread's own connection. Both
+        are free to read — no table is scanned.
+        """
+        with self._lock:
+            conn = self._conn()
+            external = conn.execute("PRAGMA data_version").fetchone()[0]
+            return (external, conn.total_changes)
 
     def get_stats(self):
         """Totals and breakdowns, computed by SQL rather than by walking rows.

@@ -1,6 +1,7 @@
 import re
 import requests
 import time
+import http_pool
 import logging
 from email_engine import EmailEngine
 
@@ -222,7 +223,10 @@ class NPIEngine:
     def _make_request(self, params, retries=3):
         for attempt in range(retries):
             try:
-                response = requests.get(self.BASE_URL, params=params, timeout=15)
+                # Pooled: a Psychology Today run makes one registry lookup per
+                # provider, all to the same host.
+                response = http_pool.session().get(self.BASE_URL, params=params,
+                                                   timeout=15)
                 response.raise_for_status()
                 return response.json()
             except Exception as e:

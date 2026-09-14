@@ -62,10 +62,12 @@ How it works, all free:
 Addresses that would bounce are **removed**, not exported with a warning label.
 
 > **Port 25.** Step 2 needs outbound port 25, which most home and office ISPs
-> block. The app detects that once, in about eight seconds, and says so — then
-> keeps running with MX-only checking. Dead domains are still caught; addresses
-> are reported `unknown` rather than `valid`. A VPN that allows port 25, or
-> running from a server, restores full verification.
+> block. The app finds out once and remembers it for two hours (in
+> `.cache/network.json`), so runs don't each open with an 8-second timeout —
+> then keeps running with MX-only checking. Dead domains are still caught;
+> addresses are reported `unknown` rather than `valid`. A VPN that allows port
+> 25, or running from a server, restores full verification. **Health Check
+> always re-tests from scratch**, so press it after connecting a VPN.
 
 ### Address inference
 

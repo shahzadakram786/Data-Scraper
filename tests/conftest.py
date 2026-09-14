@@ -24,6 +24,20 @@ def fixture(name):
         return handle.read()
 
 
+@pytest.fixture(autouse=True)
+def isolated_network_memory(tmp_path, monkeypatch):
+    """Keep every test away from the real .cache/network.json, and from anything
+    an earlier test taught the verifier about the network.
+
+    Without this, a machine whose port 25 is blocked would make verification
+    tests behave differently from a machine where it is open.
+    """
+    from verification import EmailVerifier
+    monkeypatch.setattr(EmailVerifier, "NETWORK_CACHE_PATH",
+                        str(tmp_path / "network.json"))
+    monkeypatch.setattr(EmailVerifier, "_network_state", None)
+
+
 @pytest.fixture
 def quiet_logger():
     logger = logging.getLogger("test")

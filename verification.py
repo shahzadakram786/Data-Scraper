@@ -27,7 +27,10 @@ of them is recorded. A guess the mail server confirms is not a guess any more;
 one it rejects is discarded rather than exported as a maybe.
 """
 
+import os
 import re
+import json
+import time
 import random
 import string
 import socket
@@ -145,6 +148,85 @@ class EmailVerifier:
     # Consecutive connection failures before concluding the network blocks
     # outbound port 25 entirely and giving up on SMTP probing for this session.
     BLOCKED_AFTER_FAILURES = 4
+
+    # How long to wait for the port-25 preflight. A reachable mail server
+    # accepts a connection in well under a second even from the far side of
+    # the world; a blocked port never answers at all, so waiting longer only
+    # lengthens the pause before a run on a network that blocks it.
+    PREFLIGHT_TIMEOUT = 5.0
+
+    # What the network allows is a property of the network, not of one
+    # verifier. Every run used to build a fresh verifier and rediscover it — a
+    # 3-second DNS probe plus an 8-second port-25 timeout, 11 seconds of dead
+    # air before any work, on a connection where the answer never changes. It
+    # is now remembered for the process and on disk, re-checked after
+    # NETWORK_STATE_TTL, and forgotten whenever Health Check runs.
+    NETWORK_STATE_TTL = 2 * 60 * 60
+    NETWORK_CACHE_PATH = os.path.join(".cache", "network.json")
+    _network_lock = threading.Lock()
+    _network_state = None    # loaded lazily from NETWORK_CACHE_PATH
+
+    @staticmethod
+    def _load_network_state():
+        # Always EmailVerifier, never cls: assigning through a subclass would
+        # give that subclass its own copy and split the shared memory in two.
+        with EmailVerifier._network_lock:
+            if EmailVerifier._network_state is None:
+                state = {}
+                try:
+                    with open(EmailVerifier.NETWORK_CACHE_PATH, "r",
+                              encoding="utf-8") as handle:
+                        loaded = json.load(handle)
+                    if isinstance(loaded, dict):
+                        state = loaded
+                except (OSError, ValueError):
+                    pass
+                EmailVerifier._network_state = state
+            return EmailVerifier._network_state
+
+    @staticmethod
+    def _remembered(key):
+        """A remembered fact about the network, or None if unknown or stale."""
+        entry = EmailVerifier._load_network_state().get(key)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            age = time.time() - float(entry.get("checked_at", 0))
+        except (TypeError, ValueError):
+            return None
+        if age < 0 or age > EmailVerifier.NETWORK_STATE_TTL:
+            return None
+        return entry
+
+    @staticmethod
+    def _remember(key, **values):
+        EmailVerifier._load_network_state()
+        with EmailVerifier._network_lock:
+            values["checked_at"] = time.time()
+            EmailVerifier._network_state[key] = values
+            snapshot = dict(EmailVerifier._network_state)
+        try:
+            folder = os.path.dirname(EmailVerifier.NETWORK_CACHE_PATH)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(EmailVerifier.NETWORK_CACHE_PATH, "w", encoding="utf-8") as handle:
+                json.dump(snapshot, handle)
+        except OSError:
+            pass  # still remembered in memory for this session
+
+    @staticmethod
+    def forget_network_state():
+        """Make the next verifier check DNS and port 25 from scratch.
+
+        Health Check calls this, so connecting a VPN takes effect the moment
+        you check rather than two hours later.
+        """
+        with EmailVerifier._network_lock:
+            EmailVerifier._network_state = {}
+        try:
+            os.remove(EmailVerifier.NETWORK_CACHE_PATH)
+        except OSError:
+            pass
 
     def __init__(self, logger=None, probe_smtp=True, probe_sender="",
                  helo_name="mail.example.com"):
@@ -325,6 +407,21 @@ class EmailVerifier:
                 return self._resolver
             self._resolver_checked = True
 
+            # A resolver that answered last time almost certainly still does,
+            # and probing the system one first costs a full 3-second timeout on
+            # a router that will not answer MX. Only successes are remembered:
+            # a failure may just be a moment without internet, and remembering
+            # it would quietly disable verification for hours afterwards.
+            remembered = self._remembered("resolver")
+            if remembered is not None:
+                resolver = dns.resolver.Resolver()
+                if remembered.get("nameservers"):
+                    resolver.nameservers = list(remembered["nameservers"])
+                resolver.timeout = self.DNS_TIMEOUT
+                resolver.lifetime = self.DNS_TIMEOUT
+                self._resolver = resolver
+                return resolver
+
             candidates = [(None, "the system resolver")]
             candidates += [(ns, "/".join(ns)) for ns in self.PUBLIC_RESOLVERS]
             for nameservers, label in candidates:
@@ -344,6 +441,8 @@ class EmailVerifier:
                     self.logger.info(
                         "This network's DNS server does not answer MX queries, "
                         "so email verification is using " + label + " instead.")
+                self._remember("resolver",
+                               nameservers=list(nameservers) if nameservers else None)
                 self._resolver = resolver
                 return resolver
 
@@ -471,14 +570,33 @@ class EmailVerifier:
                 return not self.smtp_blocked
             self._preflight_done = True
 
+        # An ISP that blocks port 25 does so as policy; the answer does not
+        # change between one run and the next. Both outcomes are remembered —
+        # unlike DNS, where only success is — because this is exactly the probe
+        # whose failure costs a full timeout to rediscover.
+        remembered = self._remembered("smtp")
+        if remembered is not None:
+            if remembered.get("blocked"):
+                with self._lock:
+                    self.smtp_blocked = True
+                self._warned_blocked = True
+                self.logger.info(
+                    "Outbound port 25 was blocked on this network when last "
+                    "checked, so mailbox-level checks stay off. Run Health Check "
+                    "after connecting a VPN to test it again.")
+                return False
+            return True
+
         sock = socket.socket()
-        sock.settimeout(self.SMTP_TIMEOUT)
+        sock.settimeout(self.PREFLIGHT_TIMEOUT)
         try:
             sock.connect((self.PREFLIGHT_HOST, self.SMTP_PORT))
+            self._remember("smtp", blocked=False)
             return True
         except OSError as e:
             with self._lock:
                 self.smtp_blocked = True
+            self._remember("smtp", blocked=True)
             self._warned_blocked = True
             self.logger.warning(
                 "Outbound port 25 is blocked on this network (" + str(e) + "), "

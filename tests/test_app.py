@@ -13,6 +13,7 @@ Skipped automatically where there is no display.
 """
 
 import time
+import threading
 
 import pytest
 
@@ -326,3 +327,135 @@ class TestChrome:
         gui.toggle_log()
         gui.root.update()
         assert not gui.log_open
+
+
+def _wait_for_worker(gui, timeout=15):
+    """Let a run's worker finish, pumping Tk so its after() callbacks land."""
+    deadline = time.time() + timeout
+    while gui.worker is not None and gui.worker.is_alive() and time.time() < deadline:
+        gui.root.update()
+        time.sleep(0.02)
+    for _ in range(25):
+        gui.root.update()
+        time.sleep(0.01)
+
+
+class _FakePipeline:
+    """Records which thread each pass runs on. Nothing touches the network."""
+
+    def __init__(self, added=0):
+        self.verifier = object()
+        self.added = added
+        self.threads = []
+
+    def _result(self):
+        from pipeline import RunResult
+        import storage
+        self.threads.append(threading.current_thread())
+        return RunResult(storage.RUN_OK, added=self.added, message="")
+
+    def find_missing_emails(self):
+        return self._result()
+
+    def verify_emails(self, recheck=False):
+        return self._result()
+
+    def enrich_from_cms(self, recheck=False):
+        return self._result()
+
+
+class TestResponsiveness:
+    """The window was slow for reasons that had nothing to do with the work:
+    redrawing unchanged screens, and preparing runs in a way that also read
+    widgets from a background thread."""
+
+    @staticmethod
+    def _count_stats_calls(gui, monkeypatch):
+        calls = []
+        real = gui.store.get_stats
+
+        def counting():
+            calls.append(1)
+            return real()
+
+        monkeypatch.setattr(gui.store, "get_stats", counting)
+        return calls
+
+    def test_switching_screens_with_nothing_new_does_not_redraw(self, gui, monkeypatch):
+        gui.refresh(force=True)
+        calls = self._count_stats_calls(gui, monkeypatch)
+        for key in ("results", "enrich", "outreach", "home"):
+            gui.show(key)
+            gui.root.update()
+        assert calls == [], "an unchanged database was redrawn"
+
+    def test_new_data_is_still_redrawn(self, gui, monkeypatch):
+        gui.refresh(force=True)
+        calls = self._count_stats_calls(gui, monkeypatch)
+        gui.store.add_leads_batch([lead(Phone="(512) 471-3300")])
+        gui.show("results")
+        gui.root.update()
+        assert len(calls) == 1
+        assert gui.metrics["total"].var.get() == "1"
+
+    def test_saving_settings_redraws_on_the_next_screen(self, gui, monkeypatch):
+        """The next-step box depends on settings, not only on data."""
+        gui.refresh(force=True)
+        calls = self._count_stats_calls(gui, monkeypatch)
+        gui.save_settings()
+        gui.show("home")
+        assert len(calls) == 1
+
+    def test_a_run_is_prepared_on_the_window_thread_and_worked_elsewhere(
+            self, gui, monkeypatch):
+        """Preparing a run reads settings and widgets. Tk only allows that from
+        its own thread; doing it from the worker is the kind of bug that shows
+        up as an occasional frozen window rather than an error."""
+        built_on = []
+        fake = _FakePipeline()
+
+        def build():
+            built_on.append(threading.current_thread())
+            return fake
+
+        monkeypatch.setattr(gui, "_build_pipeline", build)
+        gui.start_enrichment("find")
+        _wait_for_worker(gui)
+
+        assert built_on == [threading.main_thread()]
+        assert fake.threads and fake.threads[0] is not threading.main_thread()
+
+    def test_running_all_three_passes_writes_the_spreadsheet_once(
+            self, gui, monkeypatch):
+        """It used to export after each pass — the same workbook three times
+        in a row, which was most of the wait at the end."""
+        fake = _FakePipeline(added=2)
+        monkeypatch.setattr(gui, "_build_pipeline", lambda: fake)
+        exports = []
+        monkeypatch.setattr(gui, "_export", lambda options: exports.append(options) or 0)
+        gui.settings["auto_export"] = True
+
+        gui.start_enrichment("all")
+        _wait_for_worker(gui)
+
+        assert len(fake.threads) == 3
+        assert len(exports) == 1
+
+    def test_export_choices_are_read_before_the_worker_starts(self, gui, monkeypatch):
+        seen = []
+
+        def export(options):
+            seen.append((threading.current_thread(), options))
+            return 0
+
+        monkeypatch.setattr(gui, "_export", export)
+        gui.call_list_var.set("250")
+        gui.icp_only_var.set(True)
+
+        gui.start_export()
+        _wait_for_worker(gui)
+
+        thread, options = seen[0]
+        assert thread is not threading.main_thread()
+        assert options["call_list"] == 250
+        assert options["icp_only"] is True
