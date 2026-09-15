@@ -37,8 +37,8 @@ def seed(store):
         lead(**{"NPI Number": "PT-4444444", "Phone": "(512) 471-3303"}),  # placeholder NPI
         lead(**{"NPI Number": "5555555555", "State": "OH",
                 "Source": "NPI Registry", "Email": "c@y.example",
-                "Email Status": "role",
-                "Phone Verified": storage.PHONE_NO_RECORD}),       # CMS already checked
+                "Email Status": "role", "NPI Checked": "2026-09-15",
+                "Phone Verified": storage.PHONE_NO_RECORD}),       # both passes already ran
     ])
 
 
@@ -55,6 +55,7 @@ class TestCountingInTheDatabase:
         {"has_email": True},
         {"unverified": True},
         {"needs_cms": True},
+        {"needs_npi": True},
         {"state": "OH"},
         {"source": "NPI Registry"},
         {"min_score": 20},
@@ -87,12 +88,13 @@ class TestCountingInTheDatabase:
         assert store.pending_counts() == {
             "missing_email": 2,   # 3333333333 and the placeholder
             "unverified": 1,      # b@x.example
+            "needs_npi": 4,       # all but the one already matched
             "needs_cms": 3,       # real NPIs not yet looked up; not the placeholder
         }
 
     def test_an_empty_database_has_nothing_pending(self, store):
         assert store.pending_counts() == {
-            "missing_email": 0, "unverified": 0, "needs_cms": 0}
+            "missing_email": 0, "unverified": 0, "needs_npi": 0, "needs_cms": 0}
 
 
 # ---------------------------------------------------- the change fingerprint

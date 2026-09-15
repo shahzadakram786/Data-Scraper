@@ -349,6 +349,15 @@ def cmd_suppress(args, settings, logger):
     return EXIT_OK
 
 
+def cmd_enrich_npi(args, settings, logger):
+    reporter = ConsoleReporter(logger, quiet=args.quiet)
+    pipeline = build_pipeline(settings, logger, reporter)
+    result = pipeline.enrich_from_npi(recheck=args.recheck)
+    if settings.get("auto_export"):
+        export(pipeline.store, settings, logger)
+    return report_result(result, logger)
+
+
 def cmd_update(args, settings, logger):
     """Check for, and unless --check is given apply, an update to this copy."""
     # Imported here rather than at the top: this command runs alone on the
@@ -508,6 +517,15 @@ def build_parser():
     enrich_cms.add_argument("--recheck", action="store_true",
                             help="Re-query providers already checked.")
     enrich_cms.set_defaults(func=cmd_enrich_cms)
+
+    enrich_npi = subparsers.add_parser(
+        "enrich-npi",
+        help="Match leads to their NPI record: the phone number on that record "
+             "(kept beside the website number), gender, and missing address "
+             "details.")
+    enrich_npi.add_argument("--recheck", action="store_true",
+                            help="Look up leads that were already matched.")
+    enrich_npi.set_defaults(func=cmd_enrich_npi)
 
     send = subparsers.add_parser(
         "send", help="Send an outreach campaign (dry run unless --send).")

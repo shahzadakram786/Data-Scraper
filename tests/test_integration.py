@@ -269,7 +269,8 @@ class TestFullChain:
 
             data = workbook["Texas - Psychology Today"]
             data_headers = [c.value for c in data[1]]
-            assert data_headers == storage.HEADERS, "export schema is stable"
+            assert data_headers == [h or None for h in storage.EXPORT_LAYOUT], \
+                "the tab follows the working sheet's column order"
         finally:
             workbook.close()
 

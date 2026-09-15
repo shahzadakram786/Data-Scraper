@@ -92,6 +92,7 @@ class LeadPipeline:
     EMAIL_WORKERS = 5   # DDGS self-throttles across the pool when rate-limited
     VERIFY_WORKERS = 8  # DNS/SMTP is almost all waiting
     CMS_WORKERS = 6     # each lookup is ~2s of relay round-trip, all waiting
+    NPI_WORKERS = 4     # the registry is a free public API; stay polite
     FLUSH_EVERY = 50    # leads buffered before a database write
 
     def __init__(self, store, npi_engine, email_engine, pt_engine,
@@ -388,6 +389,13 @@ class LeadPipeline:
             "Last Updated": "",
             "Source": "Psychology Today",
             "Phone Source": phone_source,
+            # From the matched NPI record, beside the website number in Phone.
+            # Blank when the match was not confident enough to trust.
+            "Gender": npi_match.get("Gender", "") if npi_match else "",
+            "NPI Phone": npi_match.get("NPI Phone", "") if npi_match else "",
+            # The registry was asked during collection, match or not, so the
+            # NPI details pass does not ask again.
+            "NPI Checked": datetime.now(timezone.utc).date().isoformat(),
         }
         self.attach_verification(lead, person_name=entry.get("name"),
                                  note=email_source)
@@ -714,6 +722,136 @@ class LeadPipeline:
                 "were still removed.", "warning")
         status = RUN_STOPPED if stopped else RUN_OK
         return self._finish(run_id, status, done, message)
+
+    # Filled from the NPI record only where collection left them empty. What a
+    # provider publishes about themselves is newer than their registry entry.
+    NPI_FILL_BLANKS = ("Address", "City", "Zip", "Specialty", "Organization Name")
+
+    def enrich_from_npi(self, recheck=False):
+        """Match each lead to its NPI Registry record and take from it the
+        practice phone, gender, and any address details collection missed.
+
+        Phone keeps the number found on the provider's own website; the
+        registry's goes in NPI Phone beside it, so whoever calls has both. A
+        lead with no phone at all gets the registry number in Phone as well.
+
+        Psychology Today leads collected without a match carry a "PT-<id>"
+        placeholder. They are tried again by name, city and state, and take the
+        NPI number only when exactly one provider matches — the same rule
+        collection applies. Gender comes only from a matched record; with no
+        confident match it stays blank rather than being guessed.
+        """
+        if not self.npi_engine:
+            return RunResult(RUN_FAILED, message="The NPI Registry is not available.")
+
+        run_id = self.store.start_run("npi_enrich", "recheck" if recheck else "new only")
+        pending = list(self.store.iter_leads() if recheck
+                       else self.store.iter_leads(needs_npi=True))
+        if not pending:
+            self.reporter.log("Every lead has already been matched against the NPI Registry.")
+            return self._finish(run_id, RUN_OK, 0, "Nothing to do.")
+
+        self.reporter.phase(
+            "Matching {0} providers against the NPI Registry...".format(len(pending)))
+        total = len(pending)
+        done = matched = attached = phones = genders = failed = 0
+        stopped = False
+
+        with ThreadPoolExecutor(max_workers=self.NPI_WORKERS) as executor:
+            futures = {executor.submit(self._npi_updates_for, lead): lead
+                       for lead in pending}
+            for future in as_completed(futures):
+                if self.reporter.stopped():
+                    stopped = True
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                lead = futures[future]
+                done += 1
+                try:
+                    updates = future.result()
+                except Exception as e:
+                    updates = None
+                    self.reporter.log("NPI lookup failed for {0}: {1}".format(
+                        lead.get("NPI Number"), e), "warning")
+                if updates is None:
+                    # Not recorded as checked, so the next run tries again.
+                    failed += 1
+                    self.reporter.progress(done, total)
+                    continue
+
+                if len(updates) > 1:
+                    matched += 1
+                npi = updates.get("NPI Number")
+                if npi and npi != lead.get("NPI Number"):
+                    if self.store.update_lead(lead["_id"], {"NPI Number": npi}):
+                        attached += 1
+                    updates.pop("NPI Number")
+                if updates.get("NPI Phone") and not lead.get("NPI Phone"):
+                    phones += 1
+                if updates.get("Gender") and not lead.get("Gender"):
+                    genders += 1
+                self.store.update_lead(lead["_id"], updates)
+                self.reporter.progress(done, total)
+
+        message = (
+            "Checked {0} providers — {1} matched an NPI record, {2} NPI phone "
+            "numbers and {3} genders added, {4} Psychology Today leads given "
+            "their NPI number.".format(done - failed, matched, phones, genders,
+                                       attached))
+        self.reporter.log(message)
+        if failed:
+            self.reporter.log(
+                "{0} lookups could not reach the registry; they will be tried "
+                "again next run.".format(failed), "warning")
+        status = RUN_STOPPED if stopped else RUN_OK
+        return self._finish(run_id, status, matched, message)
+
+    def _npi_updates_for(self, lead):
+        """Fields to write for one lead, or None when the registry could not be
+        reached. Always includes NPI Checked when it returns, so a provider the
+        registry has no record of is not looked up again."""
+        npi = str(lead.get("NPI Number") or "")
+        first = str(lead.get("Provider First Name") or "").strip()
+        last = str(lead.get("Provider Last Name") or "").strip()
+        org = str(lead.get("Organization Name") or "").strip()
+        state = str(lead.get("State") or "").strip()
+        city = str(lead.get("City") or "").strip() or None
+
+        if re.fullmatch(r"\d{10}", npi):
+            record = self.npi_engine.find_by_number(npi)
+        elif first and last and state:
+            record = self.npi_engine.find_by_name(first, last, state, city=city)
+        elif org and state:
+            record = self.npi_engine.find_by_organization(org, state, city=city)
+        else:
+            record = None
+
+        failed = getattr(self.npi_engine, "last_lookup_failed", None)
+        if record is None and failed and failed():
+            return None
+
+        updates = {"NPI Checked": datetime.now(timezone.utc).date().isoformat()}
+        if not record:
+            return updates
+
+        if record.get("NPI Number") and not re.fullmatch(r"\d{10}", npi):
+            updates["NPI Number"] = str(record["NPI Number"])
+        if record.get("Gender"):
+            updates["Gender"] = record["Gender"]
+        npi_phone = record.get("NPI Phone") or record.get("Phone") or ""
+        if npi_phone:
+            updates["NPI Phone"] = npi_phone
+            if not lead.get("Phone") and self._dialable(npi_phone):
+                updates["Phone"] = npi_phone
+                updates["Phone Source"] = "NPI Registry"
+        for field in self.NPI_FILL_BLANKS:
+            if record.get(field) and not lead.get(field):
+                updates[field] = record[field]
+        return updates
+
+    @staticmethod
+    def _dialable(phone):
+        return len(storage.normalize_phone_key(phone) or "") == 10
 
     def enrich_from_cms(self, recheck=False):
         """Third pass: attach Medicare billing volume, practice size and the

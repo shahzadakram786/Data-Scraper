@@ -134,7 +134,7 @@ type.
 
 ## 4. Enriching what you collected
 
-Go to **2. Enrich**. Three passes, run them in this order. Each one tells you
+Go to **2. Enrich**. Four passes, run them in this order. Each one tells you
 how much work is waiting.
 
 ### a. Find missing email addresses
@@ -152,7 +152,21 @@ Checks every address against its domain's real mail server.
 addresses that bounce, which is the fastest way to get your sending domain
 blacklisted.
 
-### c. Add Medicare billing volume and practice size
+### c. Match NPI records
+
+Looks every provider up in the federal NPI Registry and adds:
+
+- **NPI Phone** — the practice number on their federal record, *beside* the
+  website number in `Phone`, so you have both to try.
+- **Gender** — from their NPI record. Left blank for practices and for anyone
+  without a confident match; it is never guessed from a name.
+- Any address, city, ZIP or specialty that collection left empty.
+
+Psychology Today leads that were never matched to an NPI number get one more
+attempt by name and city, and take the number only when exactly one provider
+matches. **Fast** — about a second per lead.
+
+### d. Add Medicare billing volume and practice size
 
 Looks each provider up in federal Medicare data and attaches what they bill per
 year, how many clinicians are in their practice, and the phone number they filed

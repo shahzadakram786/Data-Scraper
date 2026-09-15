@@ -130,6 +130,49 @@ US proxy set in Settings.
 
 ---
 
+## NPI records: a second phone number, and gender
+
+**Enrich → Match NPI records** (`python cli.py enrich-npi`) looks every lead up
+in the federal NPI Registry and adds:
+
+| Column | Meaning |
+| :--- | :--- |
+| `NPI Phone` | The practice phone on the provider's NPI record. `Phone` keeps the number from their own website; this sits beside it, so there are two to try. A lead with no phone at all gets it in `Phone` too. |
+| `Gender` | From the provider's own NPI record. Blank for organisations, and for anyone without a confident match — never guessed from a name. |
+
+Address, city, ZIP, specialty and practice name are filled in only where
+collection left them empty. Psychology Today leads saved without an NPI number
+(`PT-…`) are tried again by name, city and state, and take the number only when
+exactly one provider matches. New Psychology Today, NPI and ZocDoc leads get
+both columns while they are collected, so the pass is mainly for leads you
+already have.
+
+---
+
+## Spreadsheet layout
+
+Every state tab uses the working sheet's column order, so rows paste straight
+into it:
+
+```
+NPI Number · Provider First Name · Provider Last Name · Organization Name ·
+Email · Phone · Outreach Status · Comments · (unnamed) · Date · Address · City ·
+State · Zip · Specialty · Website · Last Updated · Source · Phone Source ·
+All Emails Found · Role · LinkedIn · Facebook · Instagram · Other Social
+```
+
+followed by what this tool adds: `Gender`, `NPI Phone`, `Phone Verified`,
+`Email Status`, `Email Confidence`, `Lead Score`, `Practice Size`,
+`Annual Billing`, `Medicare Paid`, `Patient Volume`, `First Seen`.
+
+**What you type is kept.** `Outreach Status`, `Comments`, `Date` and the unnamed
+column are read back out of the existing workbook (or Google Sheet) before each
+export replaces it, and written straight back — as are the Call List's
+`Outcome` and `Notes`. Every other column is generated, so an edit to one of
+those is overwritten by the next export.
+
+---
+
 ## Phone verification
 
 Numbers are graded by where they came from (see Accuracy rules below), and the
@@ -188,7 +231,10 @@ carries a plain-English reason:
 
 Only facts that were actually collected appear — nothing is inferred to pad the
 line out. It also has **Outcome** (a dropdown: Contacted / Replied / Meeting /
-Won / Lost) and **Notes** columns, left blank for whoever works the list.
+Won / Lost) and **Notes** columns for whoever works the list. Both are saved
+before the next export and written back: Outcome as the lead's
+`Outreach Status`, Notes as its `Comments`. `NPI Phone` shows the registry
+number only when it differs from `Phone`.
 
 Control the size on the Results tab, or from the command line:
 
@@ -370,6 +416,7 @@ python cli.py collect-npi --state TX --specialty Psychiatry
 python cli.py import-npi --file numbers.txt
 python cli.py find-emails                             # second pass for blanks
 python cli.py verify                                  # check every address
+python cli.py enrich-npi                              # NPI phone + gender
 python cli.py enrich-cms                              # billing volume + practice size
 python cli.py send --template pitch.txt --icp         # dry run; add --send to deliver
 python cli.py suppress --add someone@practice.com     # never contact again

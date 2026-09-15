@@ -70,7 +70,54 @@ FIELD_COLUMNS = (
     ("Medicare Paid", "medicare_paid"),
     ("Patient Volume", "patient_volume"),
     ("Phone Verified", "phone_verified"),
+    # --- added with the NPI details pass and the working-sheet layout ---
+    # Gender is the sex on the provider's own NPI record: blank for
+    # organisations and for anyone not confidently matched, never guessed from
+    # a name.
+    ("Gender", "gender"),
+    # The practice phone on the NPI record, kept beside Phone (which prefers
+    # the provider's own website), so whoever calls has both numbers.
+    ("NPI Phone", "npi_phone"),
+    # Filled in by whoever works the lead, in the spreadsheet. Stored here so
+    # the next export writes them back instead of wiping them.
+    ("Comments", "comments"),
+    ("Date", "outreach_date"),
+    ("Extra", "extra"),
 )
+
+# Kept in the database, never exported.
+INTERNAL_COLUMNS = (
+    # When the NPI details pass last looked this lead up. Gender and NPI Phone
+    # are legitimately blank for many leads, so an empty value cannot be what
+    # means "not checked yet".
+    ("NPI Checked", "npi_checked"),
+)
+
+# The spreadsheet's column order. It matches the working sheet this tool
+# feeds: that sheet's own columns first, exactly as it has them, then what this
+# tool adds — in the slots where that sheet has none, so a paste still lines
+# up. "" is the unnamed column that sheet has between Comments and Date;
+# whatever is typed into it is kept, as the "Extra" field.
+EXPORT_LAYOUT = (
+    "NPI Number", "Provider First Name", "Provider Last Name",
+    "Organization Name", "Email", "Phone", "Outreach Status", "Comments", "",
+    "Date", "Address", "City", "State", "Zip", "Specialty", "Website",
+    "Last Updated", "Source", "Phone Source", "All Emails Found", "Role",
+    "LinkedIn", "Facebook", "Instagram", "Other Social",
+    # --- added by this tool ---
+    "Gender", "NPI Phone", "Phone Verified",
+    "Email Status", "Email Confidence", "Lead Score",
+    "Practice Size", "Annual Billing", "Medicare Paid", "Patient Volume",
+    "First Seen",
+)
+
+# Export header -> stored field, where the two differ.
+EXPORT_FIELD = {"": "Extra"}
+
+# What a person types into the spreadsheet. Read back before every export
+# overwrites the file, so notes made while working the list survive the next
+# run. Every other column is generated, and simply rewritten.
+EDITABLE_FIELDS = ("Outreach Status", "Comments", "Date", "Extra")
 
 # Numeric columns, so the exporter writes them as numbers rather than text —
 # otherwise Excel sorts 100 before 20 before 9.
@@ -91,8 +138,10 @@ PHONE_FROM_CMS = "From federal enrollment record"
 PHONE_NO_RECORD = "No federal enrollment record"
 
 HEADERS = [header for header, _ in FIELD_COLUMNS]
-HEADER_TO_COLUMN = dict(FIELD_COLUMNS)
-COLUMN_TO_HEADER = {col: header for header, col in FIELD_COLUMNS}
+# Every column the leads table holds: the exported fields plus the internal ones.
+STORED_COLUMNS = FIELD_COLUMNS + INTERNAL_COLUMNS
+HEADER_TO_COLUMN = dict(STORED_COLUMNS)
+COLUMN_TO_HEADER = {col: header for header, col in STORED_COLUMNS}
 
 # Run outcomes. "empty" is deliberately distinct from "ok": a run that finished
 # without error but collected nothing is the signature of a scraper that has
@@ -363,7 +412,7 @@ class LeadStore:
 
     def _init_schema(self):
         columns = ",\n                ".join(
-            '"{0}" TEXT'.format(col) for _, col in FIELD_COLUMNS)
+            '"{0}" TEXT'.format(col) for _, col in STORED_COLUMNS)
         with self._lock:
             conn = self._conn()
             conn.executescript("""
@@ -376,7 +425,10 @@ class LeadStore:
                     updated_at TEXT NOT NULL,
                     """ + columns + """
                 );
-
+            """)
+            # Before the indexes, which name columns an older table may lack.
+            self._add_missing_columns(conn)
+            conn.executescript("""
                 -- One provider per source tab. This is the identity rule the
                 -- spreadsheet enforced by scanning every row; here it is an index.
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_identity
@@ -453,6 +505,24 @@ class LeadStore:
                 (str(self.SCHEMA_VERSION),))
             conn.commit()
 
+    def _add_missing_columns(self, conn):
+        """Bring a leads table made by an older version up to date.
+
+        CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+        so every column added since a database was created was simply missing
+        from it — and the first query naming one ("no such column:
+        annual_billing") broke saving, counting and every screen. Adding a
+        TEXT column is instant and keeps every row; new columns start empty.
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
+        added = [column for _header, column in STORED_COLUMNS if column not in existing]
+        for column in added:
+            conn.execute('ALTER TABLE leads ADD COLUMN "{0}" TEXT'.format(column))
+        if added:
+            conn.commit()
+            self.logger.info("Updated the database with %d new column(s): %s",
+                             len(added), ", ".join(added))
+
     # ------------------------------------------------------- sheet naming
 
     @classmethod
@@ -515,7 +585,7 @@ class LeadStore:
                 db_columns = ["sheet_key", "email_key", "phone_key",
                               "created_at", "updated_at"]
                 values = [sheet_key, email_key, phone_key, now, now]
-                for header, column in FIELD_COLUMNS:
+                for header, column in STORED_COLUMNS:
                     db_columns.append(column)
                     values.append(_as_text(lead.get(header)))
 
@@ -537,9 +607,10 @@ class LeadStore:
     def update_lead(self, lead_id, updates):
         """Apply {header: value} changes to one lead and rescore it.
 
-        Used by the email-finding and verification passes. An email that would
-        collide with another lead's is rejected here rather than written and
-        deduplicated later — the unique index would refuse it anyway.
+        Used by the enrichment passes. An email that would collide with another
+        lead's is rejected here rather than written and deduplicated later — the
+        unique index would refuse it anyway. So is an NPI number the lead's tab
+        already holds, for the same reason: one provider per tab.
         """
         if not updates:
             return False
@@ -548,6 +619,14 @@ class LeadStore:
             row = conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
             if row is None:
                 return False
+
+            if "NPI Number" in updates:
+                npi = _as_text(updates.get("NPI Number"))
+                if npi != (row["npi"] or "") and self._npi_taken(conn, row["sheet_key"], npi):
+                    self.logger.info(
+                        "NPI " + npi + " is already a lead in " + row["sheet_key"] +
+                        " — keeping this lead's own number rather than duplicating it.")
+                    return False
 
             merged = self.row_to_lead(row)
             merged.update(updates)
@@ -570,6 +649,12 @@ class LeadStore:
                 set_parts.append("email_key = ?")
                 values.append(email_key)
 
+            if "Phone" in updates:
+                # Kept in step with Phone, or shared-line detection would keep
+                # comparing new leads against the number this one used to have.
+                set_parts.append("phone_key = ?")
+                values.append(normalize_phone_key(updates.get("Phone")))
+
             set_parts.append('"lead_score" = ?')
             values.append(_as_text(compute_lead_score(merged)))
             set_parts.append("updated_at = ?")
@@ -580,6 +665,54 @@ class LeadStore:
                          values)
             conn.commit()
         return True
+
+    @staticmethod
+    def _npi_taken(conn, sheet_key, npi):
+        row = conn.execute(
+            "SELECT 1 FROM leads WHERE sheet_key = ? AND npi = ? LIMIT 1",
+            (sheet_key, npi)).fetchone()
+        return row is not None
+
+    def apply_sheet_edits(self, *sources):
+        """Save what people typed into an exported spreadsheet.
+
+        Each source maps (tab, NPI number) to {field: value} for EDITABLE_FIELDS.
+        A value counts only where it differs from what the database already
+        holds: the same lead appears on its state tab and on the Call List, and
+        the untouched copy must not undo the edited one. Where two sources both
+        changed a field, the later one wins. Returns how many leads changed.
+        """
+        columns = [(field, HEADER_TO_COLUMN[field]) for field in EDITABLE_FIELDS]
+        with self._lock:
+            conn = self._conn()
+            held = {}
+            for row in conn.execute(
+                    "SELECT id, sheet_key, npi, " +
+                    ", ".join('"{0}"'.format(c) for _f, c in columns) + " FROM leads"):
+                held[(row["sheet_key"], row["npi"])] = (
+                    row["id"], {f: (row[c] or "") for f, c in columns})
+
+            changes = {}
+            for source in sources:
+                for key, fields in source.items():
+                    if key not in held:
+                        continue  # removed since that export, or a stray row
+                    lead_id, current = held[key]
+                    for field, value in fields.items():
+                        value = _as_text(value)
+                        if field in current and value != current[field]:
+                            changes.setdefault(lead_id, {})[field] = value
+
+            now = _utcnow()
+            for lead_id, fields in changes.items():
+                conn.execute(
+                    "UPDATE leads SET " +
+                    ", ".join('"{0}" = ?'.format(HEADER_TO_COLUMN[f]) for f in fields) +
+                    ", updated_at = ? WHERE id = ?",
+                    list(fields.values()) + [now, lead_id])
+            if changes:
+                conn.commit()
+        return len(changes)
 
     @staticmethod
     def _email_taken(conn, email_key, exclude_id):
@@ -602,7 +735,7 @@ class LeadStore:
     @staticmethod
     def row_to_lead(row):
         """sqlite3.Row -> the header-keyed dict the rest of the app speaks."""
-        lead = {header: (row[column] or "") for header, column in FIELD_COLUMNS}
+        lead = {header: (row[column] or "") for header, column in STORED_COLUMNS}
         lead["_id"] = row["id"]
         lead["_sheet_key"] = row["sheet_key"]
         return lead
@@ -630,8 +763,8 @@ class LeadStore:
 
     def iter_leads(self, sheet_key=None, state=None, source=None,
                    missing_email=False, has_email=False, unverified=False,
-                   needs_cms=False, min_score=None, email_statuses=None,
-                   order_by=None, limit=None):
+                   needs_cms=False, needs_npi=False, min_score=None,
+                   email_statuses=None, order_by=None, limit=None):
         """Yields leads matching the filters, as header-keyed dicts.
 
         order_by takes a key from ORDERINGS ("best", "newest", "name", ...),
@@ -646,8 +779,8 @@ class LeadStore:
         where, params = self._filter_sql(
             sheet_key=sheet_key, state=state, source=source,
             missing_email=missing_email, has_email=has_email,
-            unverified=unverified, needs_cms=needs_cms, min_score=min_score,
-            email_statuses=email_statuses)
+            unverified=unverified, needs_cms=needs_cms, needs_npi=needs_npi,
+            min_score=min_score, email_statuses=email_statuses)
 
         sql = "SELECT * FROM leads" + where + " ORDER BY " + order_clause
         if limit:
@@ -661,7 +794,7 @@ class LeadStore:
     @staticmethod
     def _filter_sql(sheet_key=None, state=None, source=None, missing_email=False,
                     has_email=False, unverified=False, needs_cms=False,
-                    min_score=None, email_statuses=None):
+                    needs_npi=False, min_score=None, email_statuses=None):
         """The WHERE clause for a set of lead filters, as (sql, params).
 
         Shared by iter_leads, count and pending_counts, so listing leads and
@@ -691,6 +824,9 @@ class LeadStore:
             # is legitimately empty for a provider CMS does not cover.
             where.append("(phone_verified IS NULL OR phone_verified = '')")
             where.append("npi GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'")
+        if needs_npi:
+            # Every lead, placeholders included: those are matched by name.
+            where.append("(npi_checked IS NULL OR npi_checked = '')")
         if min_score is not None:
             where.append("CAST(COALESCE(NULLIF(lead_score, ''), '0') AS INTEGER) >= ?")
             params.append(int(min_score))
@@ -783,8 +919,8 @@ class LeadStore:
                 "SELECT COUNT(*) AS n FROM leads" + where, params).fetchone()
         return row["n"] if row else 0
 
-    # The three enrichment backlogs, in the order the passes run.
-    PENDING_FILTERS = ("missing_email", "unverified", "needs_cms")
+    # The four enrichment backlogs, in the order the passes run.
+    PENDING_FILTERS = ("missing_email", "unverified", "needs_npi", "needs_cms")
 
     def pending_counts(self):
         """What each enrichment pass still has to do, in a single query.

@@ -211,7 +211,7 @@ class TestCallListSheet:
         workbook = openpyxl.load_workbook(path)
         try:
             sheet = workbook["Call List"]
-            score = sheet.cell(row=2, column=9).value
+            score = sheet.cell(row=2, column=[c.value for c in sheet[1]].index("Score") + 1).value
             assert isinstance(score, (int, float))
         finally:
             workbook.close()

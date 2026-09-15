@@ -61,13 +61,17 @@ HELP = {
     "enrich": (
         "Filling in what collection missed",
         [
-            "Three passes. Run them top to bottom; each one uses what the one "
+            "Four passes. Run them top to bottom; each one uses what the one "
             "before it found.",
             ("list", [
                 "Find missing emails — searches the practice's own website, "
                 "then a corroborated web search. Slow: 5–15 seconds per lead.",
                 "Verify addresses — checks each one against its real mail "
-                "server. Fast, and the most important of the three.",
+                "server. Fast, and the most important of them.",
+                "Match NPI records — the practice phone on the provider's federal "
+                "record (kept beside the website number), their gender, and any "
+                "missing address details. Gender is left blank rather than "
+                "guessed when there is no confident match.",
                 "Medicare data — annual billing, practice size, and the phone "
                 "number the provider filed federally.",
             ]),
@@ -159,7 +163,7 @@ FIRST_RUN = [
      "Go to Collect, choose Psychology Today and a state, and press the "
      "button. Leads appear as they are found."),
     ("Fill in the gaps",
-     "Go to Enrich and run the three passes top to bottom. Verify is the one "
+     "Go to Enrich and run the passes top to bottom. Verify is the one "
      "that matters most."),
     ("Open your call list",
      "Go to Results and press Open spreadsheet. The first tab is your ranked "

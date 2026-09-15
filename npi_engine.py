@@ -1,15 +1,29 @@
 import re
 import requests
 import time
+import threading
 import http_pool
 import logging
+from datetime import datetime, timezone
 from email_engine import EmailEngine
 
 class NPIEngine:
     BASE_URL = "https://npiregistry.cms.hhs.gov/api/"
-    
+
     def __init__(self, logger=None):
         self.logger = logger or logging.getLogger(__name__)
+        # Per thread, because lookups run in a worker pool against one engine.
+        self._local = threading.local()
+
+    def last_lookup_failed(self):
+        """Whether this thread's most recent lookup failed to reach the registry.
+
+        The find_* methods return None both for "no such provider" and for "the
+        registry did not answer". The NPI details pass must tell those apart: a
+        lead with no record is finished, but one whose lookup failed has to be
+        tried again next run rather than being recorded as checked.
+        """
+        return getattr(self._local, "failed", False)
 
     def fetch_providers(self, state, specialty, max_records=None, exclude_corp=False, min_updated_year=None, stop_event=None):
         """
@@ -221,6 +235,7 @@ class NPIEngine:
         return bool(words.intersection(corp_tags))
 
     def _make_request(self, params, retries=3):
+        self._local.failed = False
         for attempt in range(retries):
             try:
                 # Pooled: a Psychology Today run makes one registry lookup per
@@ -234,6 +249,7 @@ class NPIEngine:
                 if attempt < retries - 1:
                     time.sleep(2) # Wait before retry
                 else:
+                    self._local.failed = True
                     return None
 
     @staticmethod
@@ -308,6 +324,18 @@ class NPIEngine:
             "Outreach Status": "Not Contacted",
             "Last Updated": basic.get("last_updated", ""),
             "Source": "NPI Registry",
-            "Phone Source": "NPI Registry" if address_info.get("telephone_number") else ""
+            "Phone Source": "NPI Registry" if address_info.get("telephone_number") else "",
+            # Both straight from the provider's own federal record. Version 2.1
+            # of the registry API calls the field "sex"; older responses used
+            # "gender". Organisations carry neither, and stay blank.
+            "Gender": {"M": "Male", "F": "Female"}.get(
+                str(basic.get("sex") or basic.get("gender") or "").strip().upper(), ""),
+            # Formatted like every other number in the sheet; kept as the
+            # registry wrote it if it is not a dialable North American number.
+            "NPI Phone": (EmailEngine._normalize_phone(address_info.get("telephone_number", ""))
+                          or address_info.get("telephone_number", "")),
+            # Read from the registry just now, so the NPI details pass has
+            # nothing to add to a lead built from this record.
+            "NPI Checked": datetime.now(timezone.utc).date().isoformat(),
         }
 

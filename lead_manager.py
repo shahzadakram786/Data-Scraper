@@ -12,15 +12,19 @@ platform — so a workbook and a Google Sheet stay interchangeable.
 """
 
 import os
+import shutil
 import tempfile
 import logging
+from datetime import date, datetime
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from storage import HEADERS, NUMERIC_HEADERS, LeadStore
+from storage import (EXPORT_LAYOUT, EXPORT_FIELD, EDITABLE_FIELDS,
+                     GENERATED_SHEETS, NUMERIC_HEADERS, LeadStore,
+                     normalize_phone_key)
 import verification
 
 
@@ -99,7 +103,12 @@ class ExcelExporter:
 
         call_list adds a ranked "Call List" tab of that many leads at the front
         — the sheet a person actually works from. Pass 0 to leave it out.
+
+        Anything typed into the existing workbook's Outreach Status, Comments,
+        Date and unnamed columns (and the Call List's Outcome and Notes) is
+        saved to the database first, so the rewrite puts it straight back.
         """
+        self._absorb_edits(store)
         workbook = openpyxl.Workbook()
         workbook.remove(workbook.active)  # drop the default empty sheet
 
@@ -138,24 +147,31 @@ class ExcelExporter:
 
     # ------------------------------------------------------------ internals
 
+    # Widths for the columns the working-sheet layout adds.
+    LAYOUT_WIDTHS = {"Comments": 34, "": 6, "Date": 12, "Gender": 9,
+                     "NPI Phone": 16}
+
     def _write_sheet(self, worksheet, leads):
-        for index, header in enumerate(HEADERS, 1):
-            cell = worksheet.cell(row=1, column=index, value=header)
+        """One source tab, in EXPORT_LAYOUT order — the working sheet's own
+        column order, so rows paste straight into it."""
+        for index, header in enumerate(EXPORT_LAYOUT, 1):
+            cell = worksheet.cell(row=1, column=index, value=header or None)
             cell.font = self.HEADER_FONT
             cell.fill = self.HEADER_FILL
             cell.border = self.HEADER_BORDER
             cell.alignment = Alignment(horizontal="center", vertical="center")
-            worksheet.column_dimensions[get_column_letter(index)].width = \
-                self.COLUMN_WIDTHS.get(header, self.DEFAULT_WIDTH)
+            worksheet.column_dimensions[get_column_letter(index)].width = (
+                self.COLUMN_WIDTHS.get(header)
+                or self.LAYOUT_WIDTHS.get(header, self.DEFAULT_WIDTH))
 
         worksheet.row_dimensions[1].height = 20
         worksheet.freeze_panes = "A2"
         worksheet.sheet_properties.tabColor = TAB_COLORS.get(
             LeadStore.source_of_sheet(worksheet.title), DEFAULT_TAB_COLOR)
 
-        status_column = HEADERS.index("Email Status") + 1
-        email_column = HEADERS.index("Email") + 1
-        score_column = HEADERS.index("Lead Score") + 1
+        status_column = EXPORT_LAYOUT.index("Email Status") + 1
+        email_column = EXPORT_LAYOUT.index("Email") + 1
+        score_column = EXPORT_LAYOUT.index("Lead Score") + 1
 
         # Styling every cell costs three attribute writes per cell, which at
         # 20,000 leads is over a million operations and roughly 45 seconds. Past
@@ -169,13 +185,14 @@ class ExcelExporter:
                 "stays fast; the header, filter and frozen pane are unaffected.",
                 len(leads), worksheet.title)
 
+        fields = [EXPORT_FIELD.get(header, header) for header in EXPORT_LAYOUT]
         for row_number, lead in enumerate(leads, start=2):
             stripe = decorate and (row_number % 2 == 0)
-            for index, header in enumerate(HEADERS, 1):
-                value = lead.get(header, "")
+            for index, field in enumerate(fields, 1):
+                value = lead.get(field, "")
                 # Numbers must be written as numbers, or Excel sorts the column
                 # as text and puts 100 before 20 before 9.
-                if header in NUMERIC_HEADERS:
+                if field in NUMERIC_HEADERS:
                     value = _as_number(value)
                 cell = worksheet.cell(row=row_number, column=index, value=value)
                 if decorate:
@@ -183,7 +200,7 @@ class ExcelExporter:
                     cell.border = self.DATA_BORDER
                     if stripe:
                         cell.fill = self.STRIPE_FILL
-                if header in self.MONEY_HEADERS and value != "":
+                if field in self.MONEY_HEADERS and value != "":
                     cell.number_format = '#,##0'
 
             status = str(lead.get("Email Status") or "").strip().lower()
@@ -203,11 +220,22 @@ class ExcelExporter:
     CALL_LIST_SHEET = "Call List"
     CALL_LIST_COLUMNS = (
         ("#", 5), ("Name", 26), ("Practice", 30), ("Phone", 16),
+        # Only when it is a different number from Phone — a second one to try.
+        ("NPI Phone", 16),
         ("Email", 30), ("City", 15), ("State", 7), ("Specialty", 24),
         ("Score", 7), ("Why this lead", 62),
-        # Left blank on purpose — these are for the caller to fill in.
+        # For the caller to fill in. Saved to the database before the next
+        # export, which writes them back: Outcome is the lead's Outreach Status
+        # and Notes its Comments, so the state tab shows the same thing.
         ("Outcome", 14), ("Notes", 34),
+        # Which lead each row is, so those edits find their way back.
+        ("NPI Number", 13), ("Source Tab", 26),
     )
+    CALL_LIST_FIELDS = {"Outcome": "Outreach Status", "Notes": "Comments"}
+
+    @classmethod
+    def _call_column(cls, header):
+        return [h for h, _w in cls.CALL_LIST_COLUMNS].index(header) + 1
     OUTCOMES = "Not Contacted,Contacted,Replied,Meeting,Won,Lost,Bad Contact"
 
     def _write_call_list(self, workbook, store, limit=100, icp_only=False):
@@ -239,11 +267,15 @@ class ExcelExporter:
         for row_number, lead in enumerate(leads, start=2):
             name = " ".join(filter(None, (lead.get("Provider First Name"),
                                           lead.get("Provider Last Name")))).strip()
+            npi_phone = lead.get("NPI Phone", "")
+            if normalize_phone_key(npi_phone) == normalize_phone_key(lead.get("Phone")):
+                npi_phone = ""
             values = (
                 row_number - 1,
                 name or lead.get("Organization Name", ""),
                 lead.get("Organization Name", "") if name else "",
                 lead.get("Phone", ""),
+                npi_phone,
                 lead.get("Email", ""),
                 lead.get("City", ""),
                 lead.get("State", ""),
@@ -251,7 +283,9 @@ class ExcelExporter:
                 _as_number(lead.get("Lead Score")),
                 lead.get("Why", ""),
                 lead.get("Outreach Status") or "Not Contacted",
-                "",
+                lead.get("Comments", ""),
+                lead.get("NPI Number", ""),
+                lead.get("_sheet_key", ""),
             )
             stripe = (row_number % 2 == 0)
             for index, value in enumerate(values, 1):
@@ -262,7 +296,7 @@ class ExcelExporter:
                     cell.fill = self.STRIPE_FILL
             worksheet.cell(row=row_number, column=1).alignment = \
                 Alignment(horizontal="center")
-            worksheet.cell(row=row_number, column=9).alignment = \
+            worksheet.cell(row=row_number, column=self._call_column("Score")).alignment = \
                 Alignment(horizontal="center")
 
             # Colour the email cell by how much it can be trusted, same key as
@@ -270,10 +304,11 @@ class ExcelExporter:
             fill_color = STATUS_FILLS.get(
                 str(lead.get("Email Status") or "").strip().lower())
             if fill_color:
-                worksheet.cell(row=row_number, column=5).fill = PatternFill(
-                    start_color=fill_color, end_color=fill_color, fill_type="solid")
+                worksheet.cell(row=row_number, column=self._call_column("Email")).fill = \
+                    PatternFill(start_color=fill_color, end_color=fill_color,
+                                fill_type="solid")
 
-        outcome_column = get_column_letter(11)
+        outcome_column = get_column_letter(self._call_column("Outcome"))
         validation = DataValidation(type="list", formula1='"' + self.OUTCOMES + '"',
                                     allow_blank=True)
         validation.add("{0}2:{0}{1}".format(outcome_column, len(leads) + 1))
@@ -346,6 +381,46 @@ class ExcelExporter:
             worksheet.cell(row=row_number, column=2, value=count)
             row_number += 1
 
+    def _absorb_edits(self, store):
+        """Save what was typed into the workbook this export is about to replace."""
+        if not os.path.exists(self.filename):
+            return
+        try:
+            workbook = openpyxl.load_workbook(self.filename, read_only=True,
+                                              data_only=True)
+        except Exception as e:
+            # Nothing can be read back out of it, but replacing it would still
+            # destroy whatever it holds — so a copy is set aside first.
+            root, extension = os.path.splitext(self.filename)
+            backup = "{0}.unreadable-{1:%Y%m%d-%H%M%S}{2}".format(
+                root, datetime.now(), extension)
+            try:
+                shutil.copy2(self.filename, backup)
+                kept = " A copy was kept as " + os.path.basename(backup) + "."
+            except OSError:
+                kept = ""
+            self.logger.warning(
+                "Could not read %s to keep the notes typed into it (%s).%s",
+                os.path.basename(self.filename), e, kept)
+            return
+
+        tabs, call_list = {}, {}
+        try:
+            for name in workbook.sheetnames:
+                rows = workbook[name].iter_rows(values_only=True)
+                if name == self.CALL_LIST_SHEET:
+                    call_list.update(call_list_edits(rows, self.CALL_LIST_FIELDS))
+                elif name not in GENERATED_SHEETS:
+                    tabs.update(sheet_edits(name, rows))
+        finally:
+            workbook.close()
+
+        # The state tab is applied last, so it wins where both were edited.
+        changed = store.apply_sheet_edits(call_list, tabs)
+        if changed:
+            self.logger.info("Kept what was typed into %s for %d leads.",
+                             os.path.basename(self.filename), changed)
+
     def _save(self, workbook):
         """Save via a temp file plus an atomic rename, so a failure partway
         through leaves the existing workbook exactly as it was rather than
@@ -362,6 +437,91 @@ class ExcelExporter:
             raise
         finally:
             workbook.close()
+
+
+def sheet_edits(sheet_name, rows):
+    """{(tab, NPI number): {field: value}} for the editable columns of one tab.
+
+    Columns are found by header, so a tab someone rearranged still reads
+    correctly. Only columns the tab actually has are read: a workbook from an
+    older version has no Comments column, and a missing column is not an
+    emptied one.
+    """
+    rows = iter(rows)
+    headers = _header_row(rows)
+    if not headers or "NPI Number" not in headers:
+        return {}
+    columns = {}
+    for header in EXPORT_LAYOUT:
+        field = EXPORT_FIELD.get(header, header)
+        if field not in EDITABLE_FIELDS:
+            continue
+        if header:
+            if header in headers:
+                columns[field] = headers.index(header)
+            continue
+        # The unnamed column has no header to find, so it is found by its
+        # neighbour: the column straight after the one the layout puts before it.
+        before = EXPORT_LAYOUT[EXPORT_LAYOUT.index(header) - 1]
+        if before in headers:
+            spare = headers.index(before) + 1
+            if spare < len(headers) and headers[spare] == "":
+                columns[field] = spare
+    return _collect_edits(rows, headers.index("NPI Number"), lambda row: sheet_name,
+                          columns)
+
+
+def call_list_edits(rows, fields):
+    """The same, for the Call List: each row names its own tab and NPI number."""
+    rows = iter(rows)
+    headers = _header_row(rows)
+    if not headers or "NPI Number" not in headers or "Source Tab" not in headers:
+        return {}
+    tab_at = headers.index("Source Tab")
+    columns = {field: headers.index(header)
+               for header, field in fields.items() if header in headers}
+    return _collect_edits(rows, headers.index("NPI Number"),
+                          lambda row: _cell_text(row[tab_at]) if tab_at < len(row) else "",
+                          columns)
+
+
+def _collect_edits(rows, npi_at, tab_of, columns):
+    edits = {}
+    if not columns:
+        return edits
+    for row in rows:
+        if not row or npi_at >= len(row):
+            continue
+        npi, tab = _cell_text(row[npi_at]), tab_of(row)
+        if not npi or not tab:
+            continue
+        edits[(tab, npi)] = {field: (_cell_text(row[index]) if index < len(row) else "")
+                             for field, index in columns.items()}
+    return edits
+
+
+def _header_row(rows):
+    try:
+        return [_cell_text(value) for value in next(rows)]
+    except StopIteration:
+        return None
+
+
+def _cell_text(value):
+    """A spreadsheet cell as the text the database stores. Excel hands back real
+    dates and floats for what people type, and 2026-09-15 must stay 2026-09-15
+    rather than become "2026-09-15 00:00:00"."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        if (value.hour, value.minute, value.second) == (0, 0, 0):
+            return value.date().isoformat()
+        return value.isoformat(sep=" ", timespec="minutes")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
 
 
 def _as_number(value):
@@ -421,6 +581,8 @@ class GoogleSheetsExporter:
 
     def export(self, store, only_sheets=None, min_score=None,
                email_statuses=None, progress=None):
+        self._absorb_edits(store)
+        fields = [EXPORT_FIELD.get(header, header) for header in EXPORT_LAYOUT]
         written = 0
         for sheet_name in (only_sheets or store.sheet_names()):
             leads = list(store.iter_leads(
@@ -429,8 +591,8 @@ class GoogleSheetsExporter:
             if not leads:
                 continue
             worksheet = self._worksheet_for(sheet_name, len(leads))
-            values = [HEADERS]
-            values.extend([[str(lead.get(h, "")) for h in HEADERS] for lead in leads])
+            values = [list(EXPORT_LAYOUT)]
+            values.extend([[str(lead.get(f, "")) for f in fields] for lead in leads])
             worksheet.clear()
             worksheet.update(values, "A1", value_input_option="USER_ENTERED")
             written += len(leads)
@@ -439,20 +601,38 @@ class GoogleSheetsExporter:
         self.logger.info("Exported " + str(written) + " leads to Google Sheets.")
         return written
 
+    def _absorb_edits(self, store):
+        """Save what was typed into the Google Sheet before its tabs are cleared.
+
+        Deliberately not wrapped in a try: if the sheet cannot be read, the
+        export fails rather than clearing tabs whose notes were never saved.
+        """
+        known = set(store.sheet_names())
+        edits = {}
+        for worksheet in self.spreadsheet.worksheets():
+            if worksheet.title in known:
+                edits.update(sheet_edits(worksheet.title, worksheet.get_all_values()))
+        changed = store.apply_sheet_edits(edits)
+        if changed:
+            self.logger.info("Kept what was typed into the Google Sheet for %d leads.",
+                             changed)
+
     def _worksheet_for(self, sheet_name, row_count):
         import gspread
         needed_rows = max(row_count + 10, 100)
+        columns = len(EXPORT_LAYOUT)
         try:
             worksheet = self.spreadsheet.worksheet(sheet_name)
-            if worksheet.row_count < needed_rows:
-                worksheet.resize(rows=needed_rows, cols=len(HEADERS))
+            if worksheet.row_count < needed_rows or worksheet.col_count < columns:
+                worksheet.resize(rows=max(needed_rows, worksheet.row_count),
+                                 cols=max(columns, worksheet.col_count))
             return worksheet
         except gspread.WorksheetNotFound:
             pass
 
         worksheet = self.spreadsheet.add_worksheet(
-            title=sheet_name, rows=str(needed_rows), cols=str(len(HEADERS)))
-        last_column = get_column_letter(len(HEADERS))
+            title=sheet_name, rows=str(needed_rows), cols=str(columns))
+        last_column = get_column_letter(columns)
         worksheet.format("A1:" + last_column + "1", {
             "textFormat": {"bold": True,
                            "foregroundColor": {"red": 1, "green": 1, "blue": 1}},

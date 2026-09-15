@@ -35,3 +35,7 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# LibreOffice/Excel lock files, left while a workbook is open.
+.~lock.*#
+~$*

@@ -130,7 +130,7 @@ class TestWindowBuilds:
         expected = {
             "home": "Go to Next Step",
             "collect": "Collect from Psychology Today",
-            "enrich": "Run All Three Passes",
+            "enrich": "Run All Four Passes",
             "outreach": "Send Campaign",
             "results": "Export Spreadsheet",
             "settings": "Save Settings",
@@ -205,15 +205,24 @@ class TestNextStep:
         gui.refresh()
         assert gui._next_action == "enrich:verify"
 
-    def test_then_medicare_data(self, gui):
+    def test_then_npi_records(self, gui):
         gui.store.add_leads_batch([
             lead(**{"Email": "jane@practice.example", "Email Status": "valid"})])
+        gui.refresh()
+        assert gui._next_action == "enrich:npi"
+        assert "1 to match" in gui.step_npi.status.cget("text")
+
+    def test_then_medicare_data(self, gui):
+        gui.store.add_leads_batch([
+            lead(**{"Email": "jane@practice.example", "Email Status": "valid",
+                    "NPI Checked": "2026-09-15"})])
         gui.refresh()
         assert gui._next_action == "enrich:cms"
 
     def test_then_finishing_the_sending_setup(self, gui):
         gui.store.add_leads_batch([
             lead(**{"Email": "jane@practice.example", "Email Status": "valid",
+                    "NPI Checked": "2026-09-15",
                     "Phone Verified": "No federal enrollment record"})])
         gui.refresh()
         assert gui._next_action == "settings"
@@ -360,6 +369,9 @@ class _FakePipeline:
     def verify_emails(self, recheck=False):
         return self._result()
 
+    def enrich_from_npi(self, recheck=False):
+        return self._result()
+
     def enrich_from_cms(self, recheck=False):
         return self._result()
 
@@ -425,10 +437,10 @@ class TestResponsiveness:
         assert built_on == [threading.main_thread()]
         assert fake.threads and fake.threads[0] is not threading.main_thread()
 
-    def test_running_all_three_passes_writes_the_spreadsheet_once(
+    def test_running_all_passes_writes_the_spreadsheet_once(
             self, gui, monkeypatch):
-        """It used to export after each pass — the same workbook three times
-        in a row, which was most of the wait at the end."""
+        """It used to export after each pass — the same workbook once per pass,
+        which was most of the wait at the end."""
         fake = _FakePipeline(added=2)
         monkeypatch.setattr(gui, "_build_pipeline", lambda: fake)
         exports = []
@@ -438,8 +450,25 @@ class TestResponsiveness:
         gui.start_enrichment("all")
         _wait_for_worker(gui)
 
-        assert len(fake.threads) == 3
+        assert len(fake.threads) == 4
         assert len(exports) == 1
+
+    def test_a_run_that_crashes_says_so(self, gui, monkeypatch):
+        """The failure banner read the exception after Python had cleared it,
+        so a crashed run raised a second error and the window stayed silent."""
+        messages = []
+        monkeypatch.setattr(gui.banner, "set",
+                            lambda tone, title, detail="": messages.append((tone, detail)))
+
+        def make_job():
+            def job():
+                raise RuntimeError("registry exploded")
+            return job
+
+        gui._spawn(make_job, "Working…")
+        _wait_for_worker(gui)
+
+        assert ("error", "registry exploded") in messages
 
     def test_export_choices_are_read_before_the_worker_starts(self, gui, monkeypatch):
         seen = []

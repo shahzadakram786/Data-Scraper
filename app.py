@@ -843,8 +843,17 @@ class LeadGenApp:
         self.step_verify.pack(fill=tk.X, pady=(0, 4))
         tk.Frame(card.inner, height=1, bg=T.RULE).pack(fill=tk.X, pady=10)
 
+        self.step_npi = T.StepRow(
+            card.inner, 3, "Match NPI records",
+            "Looks each provider up in the federal NPI Registry: the practice "
+            "phone on their record (kept beside the website number), their "
+            "gender, and any address details collection missed. Fast.",
+            lambda: self.start_enrichment("npi"))
+        self.step_npi.pack(fill=tk.X, pady=(0, 4))
+        tk.Frame(card.inner, height=1, bg=T.RULE).pack(fill=tk.X, pady=10)
+
         self.step_cms = T.StepRow(
-            card.inner, 3, "Add Medicare billing and practice size",
+            card.inner, 4, "Add Medicare billing and practice size",
             "Annual billing, how many clinicians are in the practice, and the "
             "phone number they filed federally. Covers Medicare-enrolled "
             "providers only.",
@@ -1524,11 +1533,12 @@ class LeadGenApp:
             ("under 30", bands.get("under 30", 0), T.MUTED)])
 
         # --- enrich step states
-        # One query for all three backlogs, handed to the next-step box below
+        # One query for all four backlogs, handed to the next-step box below
         # rather than counted a second time there.
         pending = self.store.pending_counts()
         missing = pending["missing_email"]
         unverified = pending["unverified"]
+        needs_npi = pending["needs_npi"]
         needs_cms = pending["needs_cms"]
         self.step_find.set_state(
             "All leads have an address" if not missing
@@ -1539,6 +1549,11 @@ class LeadGenApp:
             else "{0} unchecked".format(unverified),
             "ok" if not unverified else "warn",
             done=not unverified and stats["with_email"] > 0)
+        self.step_npi.set_state(
+            "Every lead matched" if not needs_npi
+            else "{0} to match".format(needs_npi),
+            "ok" if not needs_npi else "brand",
+            done=not needs_npi and stats["total"] > 0)
         self.step_cms.set_state(
             "Nothing left to look up" if not needs_cms
             else "{0} to look up".format(needs_cms),
@@ -1577,6 +1592,7 @@ class LeadGenApp:
         pending = pending or self.store.pending_counts()
         missing = pending["missing_email"]
         unverified = pending["unverified"]
+        needs_npi = pending["needs_npi"]
         needs_cms = pending["needs_cms"]
         problems = outreach.compliance_problems(self.settings)
 
@@ -1592,6 +1608,10 @@ class LeadGenApp:
             action = ("enrich:verify", "Verify {0} email addresses".format(unverified),
                       "Checking these against their mail servers is what stops "
                       "you sending to addresses that bounce.")
+        elif needs_npi:
+            action = ("enrich:npi", "Match {0} providers to NPI records".format(needs_npi),
+                      "Adds the phone number on each provider's federal record "
+                      "beside the one from their website, and their gender.")
         elif needs_cms:
             action = ("enrich:cms", "Look up {0} providers in Medicare data".format(needs_cms),
                       "Adds annual billing and practice size, which is what "
@@ -1670,7 +1690,7 @@ class LeadGenApp:
                         "paste": "Look Up Pasted NPIs"}.get(
                             getattr(self, "source_var", None)
                             and self.source_var.get(), "Start"),
-            "enrich": "Run All Three Passes",
+            "enrich": "Run All Four Passes",
             "outreach": "Send Campaign",
             "results": "Export Spreadsheet",
             "settings": "Save Settings",
@@ -1964,8 +1984,12 @@ class LeadGenApp:
             target()
         except Exception as e:
             self.logger.error("Unexpected error: %s\n%s", e, traceback.format_exc())
+            # Captured now: Python deletes `e` when the except block ends, so a
+            # lambda that reads it later, on the Tk thread, raised NameError and
+            # the banner never said the run had failed.
+            detail = str(e)
             self.post(lambda: self.banner.set(
-                "error", "The run stopped with an unexpected error.", str(e)))
+                "error", "The run stopped with an unexpected error.", detail))
         finally:
             self.post(self._end)
 
@@ -2071,7 +2095,7 @@ class LeadGenApp:
             self._spawn(make_job, "Looking up {0} NPI numbers…".format(len(numbers)))
 
     def start_enrichment(self, mode):
-        """mode: find | verify | cms | all."""
+        """mode: find | verify | npi | cms | all."""
         recheck = self.recheck_var.get()
 
         def make_job():
@@ -2088,9 +2112,9 @@ class LeadGenApp:
             export = self._export_options()
 
             def job():
-                # A single pass exports when it finishes. All three together
-                # export once at the end: writing the same workbook three times
-                # in a row was most of the wait after "Run All Three Passes".
+                # A single pass exports when it finishes. All of them together
+                # export once at the end: writing the same workbook once per pass
+                # was most of the wait after "Run All Passes".
                 per_pass_export = None if mode == "all" else export
                 quiet = (mode == "all")
                 added = 0
@@ -2104,6 +2128,11 @@ class LeadGenApp:
                     added += result.added
                     self._after_run(pipeline, result, "Email verification",
                                     quiet=quiet, export_options=per_pass_export)
+                if mode in ("npi", "all"):
+                    result = pipeline.enrich_from_npi(recheck=recheck)
+                    added += result.added
+                    self._after_run(pipeline, result, "NPI records",
+                                    quiet=quiet, export_options=per_pass_export)
                 if mode in ("cms", "all"):
                     result = pipeline.enrich_from_cms(recheck=recheck)
                     added += result.added
@@ -2116,14 +2145,15 @@ class LeadGenApp:
                         except Exception as e:
                             self.logger.error("Export failed: %s", e)
                     self.post(lambda: self.banner.set(
-                        "ok", "All three enrichment passes finished.",
+                        "ok", "All four enrichment passes finished.",
                         "Check the Results screen for what changed."))
             return job
 
         phases = {"find": "Finding missing email addresses…",
                   "verify": "Verifying email addresses…",
+                  "npi": "Matching NPI records…",
                   "cms": "Looking up Medicare data…",
-                  "all": "Running all three enrichment passes…"}
+                  "all": "Running all four enrichment passes…"}
         self._spawn(make_job, phases.get(mode, "Working…"))
 
     def start_export(self):
