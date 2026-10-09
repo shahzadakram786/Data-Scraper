@@ -4,6 +4,7 @@ import logging
 import threading
 import requests
 import http_pool
+import site_audit
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from urllib.parse import urlparse, urljoin
@@ -453,6 +454,10 @@ class EmailEngine:
             # practice's social profiles rather than re-fetching for them later.
             for column, link in (contact.get("socials") or {}).items():
                 lead_data["Other Social" if column == "Other" else column] = link
+            # The same read also says what the practice's homepage shows, for
+            # lead types. Nothing is added for a transient failure.
+            lead_data.update(site_audit.columns(contact.get("facts"),
+                                                contact.get("text", "")))
 
         if not email:
             # Fallback: direct email search, attributed only if the result
@@ -468,17 +473,19 @@ class EmailEngine:
     def scrape_website_contact_info(self, url, person_name=None):
         """Scrape an already-known website for the provider's email, phone,
         ownership role and social media profiles in a single pass over the same
-        pages.
+        pages — and record what the homepage shows, for lead types.
 
-        Returns {"email", "phone", "phone_confidence", "role", "socials"}. Any
-        value may be empty if nothing trustworthy was found. When person_name is
-        given, the provider's own direct line is preferred over the practice's
-        shared line, and "role" reports whether the site describes them as the
-        Owner/Founder/CEO of the practice. "socials" maps LinkedIn / Facebook /
-        Instagram / Other to the profile links the site links out to.
+        Returns {"email", "phone", "phone_confidence", "role", "socials",
+        "facts", "text"}. Any value may be empty if nothing trustworthy was
+        found. When person_name is given, the provider's own direct line is
+        preferred over the practice's shared line, and "role" reports whether
+        the site describes them as the Owner/Founder/CEO of the practice.
+        "socials" maps LinkedIn / Facebook / Instagram / Other to the profile
+        links the site links out to. "facts" and "text" are site_audit's
+        reading of the homepage (None and "" when there was no URL).
         """
         empty = {"email": "", "phone": "", "phone_confidence": "", "role": "",
-                 "socials": {}}
+                 "socials": {}, "facts": None, "text": ""}
         if not url:
             return dict(empty)
         if self.is_platform_site(url):
@@ -490,18 +497,22 @@ class EmailEngine:
             # — two different Delaware therapists both came back with Grow
             # Therapy's (646) number and Instagram. None of it is the
             # provider's, so nothing here is worth reading; the caller still
-            # records the profile URL itself as the Website.
+            # records the profile URL itself as the Website. For lead types it
+            # is plain evidence: they have no site of their own.
             self.logger.info(
                 f"{url.split('/')[2]} is a therapist marketplace — its contact "
                 f"details and socials belong to the platform, not the provider, "
                 f"so they are not recorded.")
-            return dict(empty)
+            result = dict(empty)
+            result["facts"] = self._profile_facts(url)
+            return result
         site_domain = self._registrable_domain(urlparse(url).netloc)
         emails = set()
         candidates = []
         socials = {}
         role = ""
-        for page, text in self._iter_candidate_pages(url):
+        home = {}
+        for page, text in self._iter_candidate_pages(url, home=home):
             for e in re.findall(self.EMAIL_REGEX, text):
                 if self._is_valid_email(e) and self._belongs_to_site(e, site_domain):
                     emails.add(e)
@@ -523,13 +534,53 @@ class EmailEngine:
             if emails and role and socials and any(c["kind"] == "personal" for c in candidates):
                 break
         phone, confidence = self._choose_phone(candidates)
+        if self.is_directory_site(url):
+            facts, site_text = self._profile_facts(url), ""
+        else:
+            facts, site_text = self._read_home(url, home)
         return {
             "email": self._pick_best_email(emails) if emails else "",
             "phone": phone,
             "phone_confidence": confidence,
             "role": role,
             "socials": socials,
+            "facts": facts,
+            "text": site_text,
         }
+
+    def read_site(self, url):
+        """(facts, text) for a practice's homepage, in one request. The Check
+        websites pass uses this for leads collected before facts were recorded."""
+        if not url:
+            return None, ""
+        if self.is_platform_site(url) or self.is_directory_site(url):
+            return self._profile_facts(url), ""
+        return self._read_home(url, self._fetch_home(url))
+
+    def _read_home(self, url, home):
+        """site_audit's reading of a fetched homepage. Never raises: a failed
+        audit must not cost the contact details scraped alongside it."""
+        if not home:
+            return None, ""
+        fetch = home.get("fetch") or site_audit.FETCH_CONNECTION
+        try:
+            return site_audit.read_homepage(home.get("html") or "",
+                                            home.get("final_url") or url,
+                                            status=home.get("status"), fetch=fetch)
+        except Exception as e:
+            self.logger.debug(f"Homepage audit failed on {url}: {e}")
+            return site_audit.failed_audit(fetch, e, home.get("status")), ""
+
+    def _profile_facts(self, url):
+        return site_audit.no_site_facts(
+            site_audit.NO_SITE_PROFILE, self._registrable_domain(urlparse(url).netloc))
+
+    @classmethod
+    def is_directory_site(cls, url):
+        """A listing page about the practice (Yelp, Healthgrades, a Facebook
+        page) rather than a site the practice runs itself."""
+        host = urlparse(url or "").netloc.lower()
+        return bool(host) and any(fragment in host for fragment in cls.DIRECTORY_DOMAINS)
 
     @classmethod
     def _choose_phone(cls, candidates):
@@ -695,31 +746,37 @@ class EmailEngine:
     # Cap on pages fetched per site, so one sprawling site can't stall a run.
     MAX_PAGES_PER_SITE = 5
 
-    def _iter_candidate_pages(self, url):
+    def _iter_candidate_pages(self, url, home=None):
         """Yields (page_url, page_html) for the site's homepage and the few
         contact/about pages it actually links to.
 
         Following the homepage's own navigation is both faster and more
         accurate than guessing fixed paths: practices use every variant of
         /about-me, /meet-the-team, /our-therapists, and guessing them all would
-        mean a dozen wasted requests per provider across a whole state."""
+        mean a dozen wasted requests per provider across a whole state.
+
+        `home`, when given, is filled with how the homepage fetch went (see
+        _fetch_home)."""
         parsed = urlparse(url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
 
-        home = self._fetch(url)
-        if home is None:
+        record = self._fetch_home(url)
+        if home is not None:
+            home.update(record)
+        home_html = record["html"]
+        if home_html is None:
             # Homepage unreachable — still try the usual paths directly.
             for path in self.FALLBACK_PATHS:
                 html = self._fetch(base_url + path)
                 if html is not None:
                     yield base_url + path, html
             return
-        yield url, home
+        yield url, home_html
 
         targets = []
         seen = {url.rstrip("/"), base_url.rstrip("/")}
         try:
-            for a in BeautifulSoup(home, "lxml").find_all("a", href=True):
+            for a in BeautifulSoup(home_html, "lxml").find_all("a", href=True):
                 href = a["href"].strip()
                 if href.startswith(("mailto:", "tel:", "#", "javascript:")):
                     continue
@@ -761,6 +818,33 @@ class EmailEngine:
         except requests.RequestException:
             pass
         return None
+
+    @staticmethod
+    def _fetch_home(page):
+        """The homepage, with how the request went. Lead types need to tell a
+        dead domain from a slow one, which _fetch's None cannot say.
+
+        A DNS failure is double-checked against hosts that always resolve: if
+        those fail too, it is this machine's connection rather than the
+        practice's domain, and is recorded as a connection problem — which is
+        evidence of nothing.
+        """
+        record = {"html": None, "final_url": page, "status": None,
+                  "fetch": site_audit.FETCH_CONNECTION}
+        try:
+            response = http_pool.session().get(page, timeout=(5, 10))
+        except requests.RequestException as e:
+            outcome = site_audit.classify_fetch_error(e)
+            if outcome == site_audit.FETCH_DNS and not site_audit.network_resolves():
+                outcome = site_audit.FETCH_CONNECTION
+            record["fetch"] = outcome
+            return record
+        record["status"] = response.status_code
+        record["final_url"] = getattr(response, "url", None) or page
+        record["fetch"] = site_audit.classify_status(response.status_code)
+        if response.status_code == 200:
+            record["html"] = response.text
+        return record
 
     def _extract_phones(self, html_text):
         """Finds every phone number on the page and classifies it by how it was
