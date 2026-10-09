@@ -6,9 +6,9 @@ links a privacy policy. The facts are read once, from the homepage the scraper
 fetches anyway for the email and phone, and stored on the lead — so editing a
 lead type later changes the next export without re-scraping anything.
 
-No database, and no network beyond the one DNS sanity check in
-network_resolves. The fetch itself lives in email_engine; what the facts mean
-lives in lead_types.
+No database, and no network beyond the two checks on this machine itself
+(network_reachable, tls_works). The fetch lives in email_engine; what the
+facts mean lives in lead_types.
 """
 
 import re
@@ -37,13 +37,16 @@ FETCH_TIMEOUT = "timeout"
 FETCH_DNS = "dns"
 FETCH_SSL = "ssl"
 FETCH_HTTP_ERROR = "http_error"
+FETCH_SERVER_ERROR = "server_error"
 FETCH_BLOCKED = "blocked"
 FETCH_CONNECTION = "connection"
 
-# Outcomes that say nothing about the practice: a slow afternoon, bot
-# protection, or this machine's own connection. They are never recorded — so
-# the next pass tries again — and never count as evidence that a site is down.
-TRANSIENT_FETCHES = frozenset({FETCH_TIMEOUT, FETCH_BLOCKED, FETCH_CONNECTION})
+# Outcomes that say nothing lasting about the practice: a slow afternoon, a
+# server having a bad minute, bot protection, or this machine's own
+# connection. They are never recorded — so the next pass tries again — and
+# never count as evidence that a site is down.
+TRANSIENT_FETCHES = frozenset({FETCH_TIMEOUT, FETCH_SERVER_ERROR, FETCH_BLOCKED,
+                               FETCH_CONNECTION})
 
 # Why a lead has no site of its own.
 NO_SITE_LISTED = "none_listed"   # Psychology Today says they list no website
@@ -55,14 +58,22 @@ WEBSITE_LISTED = "listed"
 WEBSITE_NONE = "none"
 WEBSITE_UNKNOWN = "unknown"
 
-_DNS_FAILURE_MARKERS = (
-    "getaddrinfo failed", "name or service not known", "nodename nor servname",
-    "no address associated", "name resolution", "failed to resolve",
+# A domain that does not exist (Windows errno 11001, EAI_NONAME elsewhere).
+# Only this is evidence: a temporary resolver failure (11002, EAI_AGAIN —
+# "Temporary failure in name resolution") says nothing about the domain.
+_DOMAIN_NOT_FOUND_MARKERS = (
+    "11001", "name or service not known", "nodename nor servname",
+    "no address associated", "non-existent domain",
 )
+_DNS_TEMPORARY_MARKERS = ("11002", "temporary failure", "try again")
 
-# Hosts that always resolve. When they don't either, a DNS failure is this
-# machine's connection, not the practice's domain.
-CANARY_HOSTS = ("www.google.com", "one.one.one.one")
+# Addresses that always accept connections. A connection, unlike a name
+# lookup, cannot be answered from the DNS cache for minutes after the line
+# drops, so it says whether this machine is online right now.
+CANARY_ADDRESSES = (("1.1.1.1", 443), ("8.8.8.8", 443))
+# A site whose certificate is always valid: if its handshake fails too, the
+# fault is this machine's TLS (a proxy, antivirus scanning, stale bundle).
+TLS_CANARY_URL = "https://www.google.com/"
 
 
 def classify_fetch_error(exc):
@@ -77,7 +88,9 @@ def classify_fetch_error(exc):
         return FETCH_TIMEOUT
     if isinstance(exc, requests.exceptions.ConnectionError):
         text = str(exc).lower()
-        if any(marker in text for marker in _DNS_FAILURE_MARKERS):
+        if any(marker in text for marker in _DNS_TEMPORARY_MARKERS):
+            return FETCH_CONNECTION
+        if any(marker in text for marker in _DOMAIN_NOT_FOUND_MARKERS):
             return FETCH_DNS
     return FETCH_CONNECTION
 
@@ -85,27 +98,41 @@ def classify_fetch_error(exc):
 def classify_status(status):
     """The fetch outcome for an HTTP status.
 
-    Only a missing page or a server error counts as the site being broken.
-    401, 403 and 429 are almost always bot protection turning a script away —
-    a person in a browser would see the site — so they are "blocked", which
-    is evidence of nothing.
+    Only a missing page counts as the site being broken. A 5xx is a server
+    error that may pass — 503 literally means "temporarily unavailable", and
+    firewall block pages and maintenance pages use it too — so it is tried
+    again rather than recorded. 401, 403 and 429 are almost always bot
+    protection turning a script away (a person in a browser would see the
+    site), so they are "blocked", which is evidence of nothing.
     """
     if status == 200:
         return FETCH_OK
-    if status in (404, 410) or (status is not None and status >= 500):
+    if status in (404, 410):
         return FETCH_HTTP_ERROR
+    if status is not None and status >= 500:
+        return FETCH_SERVER_ERROR
     return FETCH_BLOCKED
 
 
-def network_resolves(hosts=CANARY_HOSTS):
-    """Whether this machine can resolve names at all right now."""
-    for host in hosts:
+def network_reachable(addresses=CANARY_ADDRESSES):
+    """Whether this machine is online right now."""
+    for address in addresses:
         try:
-            socket.getaddrinfo(host, 443)
+            socket.create_connection(address, timeout=3).close()
             return True
         except OSError:
             continue
     return False
+
+
+def tls_works():
+    """Whether this machine can complete an HTTPS handshake with a site whose
+    certificate is always valid."""
+    try:
+        requests.head(TLS_CANARY_URL, timeout=5)
+        return True
+    except requests.RequestException:
+        return False
 
 
 def pack_text(text):
@@ -284,8 +311,15 @@ ACCESSIBILITY_RE = re.compile(r"accessibility|\bada[\s_-]+(?:statement|complianc
 LOGO_RE = re.compile(r"logo", re.I)
 SUBSCRIBE_RE = re.compile(r"subscribe|newsletter|mailing list")
 
+# The year must follow the mark directly — only spaces, light punctuation and
+# the other ways of writing "copyright" may come between. Anything looser
+# skips a script-filled (empty) year and reads the street number or phone
+# number after the practice's name instead.
 COPYRIGHT_RE = re.compile(
-    r"(?:©|\bcopyright\b)[^0-9]{0,30}((?:19|20)\d{2})(?:\s*[-–—]\s*((?:19|20)\d{2}))?",
+    r"(?:©|\(c\)|\bcopyright\b)"
+    r"(?:\s|[.,:]|©|\(c\)|\bcopyright\b)*"
+    r"((?:19|20)\d{2})(?!\d)"
+    r"(?:\s*[-–—]\s*((?:19|20)\d{2}(?!\d)|present\b|now\b|today\b))?",
     re.I)
 
 WP_GENERATOR_RE = re.compile(r"wordpress\s+(\d+(?:\.\d+){0,2})", re.I)
@@ -383,12 +417,19 @@ def _read(html, final_url, status, today):
 
 
 def newest_copyright_year(text, this_year):
-    """The latest year in a copyright line ("© 2012-2016" -> 2016), or None.
+    """The latest year in a copyright line ("© 2012-2016" -> 2016, "© 2019 –
+    Present" -> this year), or None.
 
     Years after next year are ignored: they are prices or phone digits that
     happen to follow the word, not dates.
     """
-    years = [int(m.group(2) or m.group(1)) for m in COPYRIGHT_RE.finditer(text or "")]
+    years = []
+    for match in COPYRIGHT_RE.finditer(text or ""):
+        end = match.group(2)
+        if end and not end[0].isdigit():
+            years.append(this_year)          # "– Present", "– now"
+        else:
+            years.append(int(end or match.group(1)))
     years = [year for year in years if 1990 <= year <= this_year + 1]
     return max(years) if years else None
 

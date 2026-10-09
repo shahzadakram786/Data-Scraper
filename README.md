@@ -245,9 +245,11 @@ finds one. **Enrich → Check websites** (`python cli.py enrich-sites`) reads th
 homepage of any lead with a website nobody has checked.
 
 **"Not checked" is not "needs it".** A lead nobody could inspect is counted and
-reported, never quietly included or left out. A timeout, a site's bot
-protection, or this machine's own dropped connection is never recorded as a
-site being down. The "good fit" types are worded as fit, not need: no public
+reported, never quietly included or left out. A timeout, a temporary server
+error, a site's bot protection, or a fault on this machine (a dropped
+connection, a DNS hiccup, broken HTTPS behind a proxy) is never recorded as a
+site being down. A dead link to a clinician's bio page is checked against the
+practice's homepage first. The "good fit" types are worded as fit, not need: no public
 page says whether a practice already has a bookkeeper.
 
 **Matches are worked out when you export, never stored**, so switching from SEO
@@ -565,7 +567,7 @@ listing pages.
 pytest
 ```
 
-860 tests over saved copies of the real pages each parser has to handle. Every
+909 tests over saved copies of the real pages each parser has to handle. Every
 accuracy rule above has a test that fails if it regresses — which is what makes
 these heuristics safe to change. Previously the only way to find out you had
 broken the phone classifier was to run a whole state and read the output.

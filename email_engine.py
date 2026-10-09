@@ -454,10 +454,16 @@ class EmailEngine:
             # practice's social profiles rather than re-fetching for them later.
             for column, link in (contact.get("socials") or {}).items():
                 lead_data["Other Social" if column == "Other" else column] = link
+            if contact.get("role"):
+                lead_data["Role"] = contact["role"]
             # The same read also says what the practice's homepage shows, for
-            # lead types. Nothing is added for a transient failure.
-            lead_data.update(site_audit.columns(contact.get("facts"),
-                                                contact.get("text", "")))
+            # lead types. Nothing is added for a transient failure — nor when
+            # the search turned up a marketplace or directory page: only a
+            # website the provider declared can prove they have none of their
+            # own, and a search result is not that.
+            facts = contact.get("facts")
+            if facts and facts.get("own_site") is not False:
+                lead_data.update(site_audit.columns(facts, contact.get("text", "")))
 
         if not email:
             # Fallback: direct email search, attributed only if the result
@@ -538,6 +544,11 @@ class EmailEngine:
             facts, site_text = self._profile_facts(url), ""
         else:
             facts, site_text = self._read_home(url, home)
+            if facts is not None and facts.get("own_site") is True:
+                # This scrape also looked for the role and social links, so
+                # finding none of them means something. A Check websites read
+                # does not look, and its facts say so by lacking this.
+                facts["contact_scraped"] = True
         return {
             "email": self._pick_best_email(emails) if emails else "",
             "phone": phone,
@@ -575,12 +586,27 @@ class EmailEngine:
         return site_audit.no_site_facts(
             site_audit.NO_SITE_PROFILE, self._registrable_domain(urlparse(url).netloc))
 
+    # The sites DIRECTORY_DOMAINS' fragments stand for, as whole domains. A
+    # page is a listing only when its host IS one of these (or a subdomain):
+    # matching the fragments themselves would call harmonywellness.com a
+    # wellness.com listing and record a real practice as having no website.
+    DIRECTORY_SITES = frozenset({
+        "npiregistry.cms.hhs.gov", "nppes.cms.hhs.gov", "npino.com", "npidb.org",
+        "hipaaspace.com", "yelp.com", "facebook.com", "linkedin.com",
+        "healthgrades.com", "vitals.com", "doximity.com", "medifind.com",
+        "wellness.com", "findatopdoc.com", "sharecare.com", "ratemds.com",
+        "healthprofs.com", "zocdoc.com", "webmd.com", "caredash.com",
+        "opencare.com", "mapquest.com", "yellowpages.com", "bbb.org",
+        "indeed.com", "glassdoor.com", "psychologytoday.com",
+    })
+
     @classmethod
     def is_directory_site(cls, url):
         """A listing page about the practice (Yelp, Healthgrades, a Facebook
         page) rather than a site the practice runs itself."""
-        host = urlparse(url or "").netloc.lower()
-        return bool(host) and any(fragment in host for fragment in cls.DIRECTORY_DOMAINS)
+        host = urlparse(url or "").netloc.lower().split(":")[0]
+        return bool(host) and any(host == domain or host.endswith("." + domain)
+                                  for domain in cls.DIRECTORY_SITES)
 
     @classmethod
     def _choose_phone(cls, candidates):
@@ -819,23 +845,38 @@ class EmailEngine:
             pass
         return None
 
-    @staticmethod
-    def _fetch_home(page):
+    @classmethod
+    def _fetch_home(cls, page):
         """The homepage, with how the request went. Lead types need to tell a
         dead domain from a slow one, which _fetch's None cannot say.
 
-        A DNS failure is double-checked against hosts that always resolve: if
-        those fail too, it is this machine's connection rather than the
-        practice's domain, and is recorded as a connection problem — which is
-        evidence of nothing.
+        A Website is often a clinician's bio page on a group practice's site.
+        When that page is gone (404/410) the site itself is checked before
+        anyone calls it down, and its homepage read instead.
         """
+        record = cls._fetch_page_record(page)
+        if record["fetch"] == site_audit.FETCH_HTTP_ERROR:
+            parsed = urlparse(page)
+            if parsed.path not in ("", "/") or parsed.query:
+                root = "{0}://{1}/".format(parsed.scheme, parsed.netloc)
+                return cls._fetch_page_record(root)
+        return record
+
+    @staticmethod
+    def _fetch_page_record(page):
+        """One GET, graded. A dead domain or a certificate error is checked
+        against this machine first: if it is offline, or cannot complete a
+        handshake with a site that always works, the fault is ours, and it is
+        recorded as a connection problem — which is evidence of nothing."""
         record = {"html": None, "final_url": page, "status": None,
                   "fetch": site_audit.FETCH_CONNECTION}
         try:
             response = http_pool.session().get(page, timeout=(5, 10))
         except requests.RequestException as e:
             outcome = site_audit.classify_fetch_error(e)
-            if outcome == site_audit.FETCH_DNS and not site_audit.network_resolves():
+            if outcome == site_audit.FETCH_DNS and not site_audit.network_reachable():
+                outcome = site_audit.FETCH_CONNECTION
+            elif outcome == site_audit.FETCH_SSL and not site_audit.tls_works():
                 outcome = site_audit.FETCH_CONNECTION
             record["fetch"] = outcome
             return record

@@ -24,13 +24,19 @@ class TestFetchOutcomes:
         (requests.exceptions.ConnectionError("Name or service not known"), "dns"),
         (requests.exceptions.ConnectionError("Connection refused"), "connection"),
         (requests.exceptions.TooManyRedirects("loop"), "connection"),
+        # Temporary resolver failures say nothing about the domain.
+        (requests.exceptions.ConnectionError("[Errno 11002] getaddrinfo failed"), "connection"),
+        (requests.exceptions.ConnectionError(
+            "[Errno -3] Temporary failure in name resolution"), "connection"),
+        (requests.exceptions.ConnectionError("getaddrinfo failed"), "connection"),
     ])
     def test_exceptions_are_graded(self, exc, expected):
         assert site_audit.classify_fetch_error(exc) == expected
 
     @pytest.mark.parametrize("status, expected", [
-        (200, "ok"), (404, "http_error"), (410, "http_error"), (500, "http_error"),
-        (503, "http_error"), (401, "blocked"), (403, "blocked"), (429, "blocked"),
+        (200, "ok"), (404, "http_error"), (410, "http_error"), (500, "server_error"),
+        (502, "server_error"), (503, "server_error"), (522, "server_error"),
+        (401, "blocked"), (403, "blocked"), (429, "blocked"),
     ])
     def test_statuses_are_graded(self, status, expected):
         assert site_audit.classify_status(status) == expected
@@ -38,16 +44,44 @@ class TestFetchOutcomes:
     def test_bot_protection_is_never_evidence(self):
         assert site_audit.FETCH_BLOCKED in site_audit.TRANSIENT_FETCHES
 
+    def test_a_server_error_is_tried_again_rather_than_recorded(self):
+        """503 means "temporarily unavailable", and firewall block pages and
+        maintenance pages answer with it too."""
+        assert site_audit.FETCH_SERVER_ERROR in site_audit.TRANSIENT_FETCHES
+
     def test_the_canary_reports_a_dead_connection(self, monkeypatch):
         def fail(*_args, **_kwargs):
             raise OSError("no network")
-        monkeypatch.setattr(site_audit.socket, "getaddrinfo", fail)
-        assert site_audit.network_resolves() is False
+        monkeypatch.setattr(site_audit.socket, "create_connection", fail)
+        assert site_audit.network_reachable() is False
 
     def test_the_canary_reports_a_live_connection(self, monkeypatch):
-        monkeypatch.setattr(site_audit.socket, "getaddrinfo",
-                            lambda *_a, **_k: [object()])
-        assert site_audit.network_resolves() is True
+        class Socket:
+            def close(self):
+                pass
+        monkeypatch.setattr(site_audit.socket, "create_connection",
+                            lambda *_a, **_k: Socket())
+        assert site_audit.network_reachable() is True
+
+    def test_the_canary_cannot_be_answered_from_a_dns_cache(self, monkeypatch):
+        """A name lookup can be answered from the cache for minutes after the
+        line drops; a connection cannot."""
+        def cached(*_args, **_kwargs):
+            return [object()]
+        monkeypatch.setattr(site_audit.socket, "getaddrinfo", cached)
+
+        def fail(*_args, **_kwargs):
+            raise OSError("no network")
+        monkeypatch.setattr(site_audit.socket, "create_connection", fail)
+        assert site_audit.network_reachable() is False
+
+    def test_tls_is_checked_against_a_known_good_site(self, monkeypatch):
+        def broken(*_args, **_kwargs):
+            raise requests.exceptions.SSLError("certificate verify failed")
+        monkeypatch.setattr(site_audit.requests, "head", broken)
+        assert site_audit.tls_works() is False
+        monkeypatch.setattr(site_audit.requests, "head", lambda *_a, **_k: object())
+        assert site_audit.tls_works() is True
 
 
 class TestStoredText:
@@ -100,7 +134,7 @@ class TestColumns:
         assert site_audit.unpack_text(cols["Site Text"]) == "hello"
         assert cols["Site Checked"] == facts["checked"]
 
-    @pytest.mark.parametrize("fetch", ["timeout", "blocked", "connection"])
+    @pytest.mark.parametrize("fetch", ["timeout", "blocked", "connection", "server_error"])
     def test_transient_outcomes_are_not_recorded(self, fetch):
         assert site_audit.columns(site_audit.base_facts(True, fetch)) == {}
 
@@ -218,6 +252,24 @@ class TestCopyright:
     def test_a_phone_number_is_not_a_year(self):
         text = "Copyright Smith Therapy (512) 555-2020"
         assert site_audit.newest_copyright_year(text, 2026) is None
+
+    @pytest.mark.parametrize("text", [
+        "© Smith Therapy, 2001 Main St, Austin",      # the script's year is missing
+        "© Smith Therapy LLC. Est. 2010",
+        "© | 2015551234",
+    ])
+    def test_a_number_after_the_name_is_not_the_year(self, text):
+        assert site_audit.newest_copyright_year(text, 2026) is None
+
+    @pytest.mark.parametrize("text, year", [
+        ("© 2019 – Present Smith Therapy", 2026),
+        ("Copyright 2015-now Smith Therapy", 2026),
+        ("©2020 Smith Therapy", 2020),
+        ("© Copyright 2019 Smith Therapy", 2019),
+        ("Copyright (c) 2018, Smith Therapy", 2018),
+    ])
+    def test_the_forms_a_year_really_takes(self, text, year):
+        assert site_audit.newest_copyright_year(text, 2026) == year
 
     def test_a_year_set_by_javascript_is_no_year(self):
         html = ('<html><body><h1>Hi</h1><footer>© <span id="year"></span> Smith '

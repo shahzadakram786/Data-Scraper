@@ -94,6 +94,46 @@ class TestExport:
         assert len(data) == 1
         assert "needs: no website of their own" in data[0]["Why this lead"]
 
+    def test_google_sheets_empties_a_tab_that_matched_nothing(self, seeded):
+        """Excel rebuilds the whole workbook; a Google Sheet's tabs persist.
+        A tab with no match this time must not keep the last export's rows."""
+        gspread = pytest.importorskip("gspread")
+        from lead_manager import GoogleSheetsExporter
+        from storage import EXPORT_LAYOUT
+
+        class Tab:
+            def __init__(self, title):
+                self.title = title
+                self.rows = [["old", "row"]] * 5
+                self.row_count, self.col_count = 100, len(EXPORT_LAYOUT)
+
+            def get_all_values(self):
+                return []
+
+            def clear(self):
+                self.rows = []
+
+            def update(self, values, start, value_input_option=None):
+                self.rows = values
+
+        class Spreadsheet:
+            def __init__(self):
+                self.tabs = {TAB: Tab(TAB)}
+
+            def worksheets(self):
+                return list(self.tabs.values())
+
+            def worksheet(self, title):
+                if title not in self.tabs:
+                    raise gspread.WorksheetNotFound(title)
+                return self.tabs[title]
+
+        exporter = GoogleSheetsExporter.__new__(GoogleSheetsExporter)
+        exporter.logger = seeded.logger
+        exporter.spreadsheet = Spreadsheet()
+        assert exporter.export(seeded, lead_types=selection("seo")) == 0
+        assert exporter.spreadsheet.tabs[TAB].rows == [list(EXPORT_LAYOUT)]
+
     def test_the_summary_names_the_selection(self, seeded, tmp_path):
         path = str(tmp_path / "out.xlsx")
         ExcelExporter(path).export(seeded, call_list=0,

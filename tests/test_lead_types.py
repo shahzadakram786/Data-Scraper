@@ -119,9 +119,9 @@ class TestSiteStatus:
     def test_nobody_looked(self):
         assert run("no_own_site", lead())[0] is None
 
-    def test_a_server_error_is_a_site_down(self):
-        row = lead(site_audit.base_facts(True, "http_error", 503, TODAY))
-        assert run("site_unreachable", row) == (True, "site down (HTTP 503)")
+    def test_a_missing_homepage_is_a_site_down(self):
+        row = lead(site_audit.base_facts(True, "http_error", 404, TODAY))
+        assert run("site_unreachable", row) == (True, "site down (HTTP 404)")
 
     def test_a_dead_domain_is_a_site_down(self):
         row = lead(site_audit.base_facts(True, "dns", today=TODAY))
@@ -188,6 +188,38 @@ class TestSiteStatus:
                              "Other Social": "https://x.com/cedar"}
         assert run("one_social_platform", other) == (True, "only on x.com")
         assert run("one_social_platform", healthy())[0] is False
+
+
+class TestReadsThatNeverLookedForRoleOrSocials:
+    """Check websites reads only the homepage's facts; it never looks for the
+    owner's title or social links. An empty Role or no socials after such a
+    read is "nobody looked", not "not the owner" or "no social profiles"."""
+
+    def homepage_only(self, **fields):
+        facts = healthy_site_facts(TODAY)
+        del facts["contact_scraped"]
+        return lead(facts, **fields)
+
+    @pytest.mark.parametrize("check_id", ["owner_answers_phone", "owner_small_practice",
+                                          "rcm_icp"])
+    def test_owner_checks_cannot_tell(self, check_id):
+        assert run(check_id, self.homepage_only(Phone="(512) 555-0100"))[0] is None
+
+    def test_a_known_role_still_counts(self):
+        row = self.homepage_only(Role="Owner", **{"Practice Size": "1"})
+        assert run("owner_small_practice", row)[0] is True
+
+    def test_no_socials_cannot_be_told(self):
+        row = self.homepage_only(Facebook="", Instagram="")
+        assert run("no_social_profiles", row)[0] is None
+        assert run("one_social_platform", row)[0] is None
+
+    def test_one_known_social_cannot_be_called_the_only_one(self):
+        assert run("one_social_platform", self.homepage_only(Instagram=""))[0] is None
+
+    def test_two_known_socials_are_never_one(self):
+        assert run("one_social_platform", self.homepage_only())[0] is False
+        assert run("no_social_profiles", self.homepage_only())[0] is False
 
 
 class TestColumnChecks:

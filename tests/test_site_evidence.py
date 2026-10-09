@@ -74,16 +74,34 @@ class TestTheScrapeRecordsTheHomepage:
         assert site_audit.columns(contact["facts"]) == {}
 
     def test_a_dead_domain_is_recorded(self, web, email_engine, monkeypatch):
-        monkeypatch.setattr(site_audit, "network_resolves", lambda *a, **k: True)
-        web({SITE: requests.exceptions.ConnectionError("getaddrinfo failed")})
+        monkeypatch.setattr(site_audit, "network_reachable", lambda *a, **k: True)
+        web({SITE: requests.exceptions.ConnectionError("[Errno 11001] getaddrinfo failed")})
         contact = email_engine.scrape_website_contact_info(SITE)
         assert contact["facts"]["fetch"] == "dns"
         assert site_audit.columns(contact["facts"])
 
     def test_our_own_outage_is_not_blamed_on_the_practice(self, web, email_engine,
                                                           monkeypatch):
-        monkeypatch.setattr(site_audit, "network_resolves", lambda *a, **k: False)
-        web({SITE: requests.exceptions.ConnectionError("getaddrinfo failed")})
+        monkeypatch.setattr(site_audit, "network_reachable", lambda *a, **k: False)
+        web({SITE: requests.exceptions.ConnectionError("[Errno 11001] getaddrinfo failed")})
+        contact = email_engine.scrape_website_contact_info(SITE)
+        assert contact["facts"]["fetch"] == "connection"
+        assert site_audit.columns(contact["facts"]) == {}
+
+    def test_a_certificate_error_is_recorded_when_tls_works_elsewhere(
+            self, web, email_engine, monkeypatch):
+        monkeypatch.setattr(site_audit, "tls_works", lambda: True)
+        web({SITE: requests.exceptions.SSLError("certificate verify failed")})
+        contact = email_engine.scrape_website_contact_info(SITE)
+        assert contact["facts"]["fetch"] == "ssl"
+        assert site_audit.columns(contact["facts"])
+
+    def test_our_own_broken_tls_is_not_blamed_on_the_practice(
+            self, web, email_engine, monkeypatch):
+        """A proxy, antivirus HTTPS scanning or a stale certificate bundle
+        would otherwise mark every practice in the run "SSL error"."""
+        monkeypatch.setattr(site_audit, "tls_works", lambda: False)
+        web({SITE: requests.exceptions.SSLError("certificate verify failed")})
         contact = email_engine.scrape_website_contact_info(SITE)
         assert contact["facts"]["fetch"] == "connection"
         assert site_audit.columns(contact["facts"]) == {}
@@ -94,11 +112,30 @@ class TestTheScrapeRecordsTheHomepage:
         assert contact["facts"]["fetch"] == "blocked"
         assert site_audit.columns(contact["facts"]) == {}
 
-    def test_a_server_error_is_recorded(self, web, email_engine):
+    def test_a_server_error_is_tried_again(self, web, email_engine):
         web({SITE: Response(503, "down", SITE)})
         contact = email_engine.scrape_website_contact_info(SITE)
+        assert contact["facts"]["fetch"] == "server_error"
+        assert site_audit.columns(contact["facts"]) == {}
+
+    def test_a_missing_homepage_is_recorded(self, web, email_engine):
+        web({SITE: Response(404, "not found", SITE)})
+        contact = email_engine.scrape_website_contact_info(SITE)
         assert contact["facts"]["fetch"] == "http_error"
-        assert contact["facts"]["status"] == 503
+        assert contact["facts"]["status"] == 404
+
+    def test_a_dead_deep_link_falls_back_to_the_homepage(self, web, email_engine):
+        bio = SITE + "team/jane-smith"
+        web({bio: Response(404, "not found", bio),
+             SITE: Response(200, fixture("site_modern.html"), SITE)})
+        facts, _text = email_engine.read_site(bio)
+        assert facts["fetch"] == "ok" and facts["viewport"] is True
+
+    def test_a_dead_deep_link_on_a_dead_site_is_recorded(self, web, email_engine):
+        bio = SITE + "team/jane-smith"
+        web({bio: Response(404, "", bio), SITE: Response(404, "", SITE)})
+        facts, _text = email_engine.read_site(bio)
+        assert facts["fetch"] == "http_error"
 
     def test_a_redirect_to_https_counts_as_https(self, web, email_engine):
         start = "http://cedargrove.example/"
@@ -116,6 +153,70 @@ class TestTheScrapeRecordsTheHomepage:
         contact = email_engine.scrape_website_contact_info(SITE)
         assert contact["email"] == "hello@cedargrove.example"
         assert contact["facts"]["audit_error"] == "RuntimeError"
+
+
+class TestDirectoryPagesAreMatchedByDomain:
+    """Directory pages are recognised by their own domain, never by a word
+    inside a practice's domain — harmonywellness.com is a practice, not
+    wellness.com."""
+
+    @pytest.mark.parametrize("url", [
+        "https://www.harmonywellness.com/", "https://austinmindwellness.com/about",
+        "https://indeedcounseling.com/", "https://vitalsignsfamilymed.com/",
+        "https://opencarepsych.com/", "https://www.sharecaretherapy.net/"])
+    def test_a_practice_whose_name_contains_a_directory_word_is_their_own(
+            self, url, email_engine):
+        assert not email_engine.is_directory_site(url)
+
+    @pytest.mark.parametrize("url", [
+        "https://www.yelp.com/biz/cedar-grove", "https://www.healthgrades.com/x",
+        "https://m.facebook.com/cedargrove", "https://www.wellness.com/dir/1/x",
+        "https://npiregistry.cms.hhs.gov/provider-view/1"])
+    def test_real_directories_are_still_recognised(self, url, email_engine):
+        assert email_engine.is_directory_site(url)
+
+    def test_such_a_practice_has_its_homepage_read(self, web, email_engine):
+        url = "https://www.harmonywellness.com/"
+        web({url: Response(200, fixture("site_modern.html"), url)})
+        facts, _text = email_engine.read_site(url)
+        assert facts["own_site"] is True and facts["viewport"] is True
+
+
+class TestSearchResultsAreNotEvidenceOfNoWebsite:
+    """Only a website the provider declared can prove they have no site of
+    their own. A marketplace profile a web search turned up proves nothing."""
+
+    def test_a_searched_marketplace_profile_records_no_facts(self, web, email_engine,
+                                                            monkeypatch):
+        web({})
+        monkeypatch.setattr(email_engine, "_find_website",
+                            lambda query: "https://headway.co/providers/jane-smith")
+        monkeypatch.setattr(email_engine, "_search_for_email_directly", lambda *a, **k: "")
+        found = email_engine.find_email({"Provider First Name": "Jane",
+                                         "Provider Last Name": "Smith"})
+        assert "Site Facts" not in found
+
+
+class TestWhatAReadLookedFor:
+
+    def test_the_contact_scrape_says_it_looked_for_role_and_socials(self, web, email_engine):
+        web({SITE: Response(200, fixture("site_modern.html"), SITE)})
+        assert email_engine.scrape_website_contact_info(SITE)["facts"]["contact_scraped"] is True
+
+    def test_a_homepage_only_read_does_not(self, web, email_engine):
+        web({SITE: Response(200, fixture("site_modern.html"), SITE)})
+        facts, _text = email_engine.read_site(SITE)
+        assert "contact_scraped" not in facts
+
+    def test_find_email_keeps_the_role_it_found(self, email_engine, monkeypatch):
+        monkeypatch.setattr(email_engine, "_find_website", lambda query: SITE)
+        monkeypatch.setattr(email_engine, "_search_for_email_directly", lambda *a, **k: "")
+        monkeypatch.setattr(email_engine, "scrape_website_contact_info", lambda url, person_name=None: {
+            "email": "", "phone": "", "phone_confidence": "", "role": "Founder",
+            "socials": {}, "facts": None, "text": ""})
+        found = email_engine.find_email({"Provider First Name": "Jane",
+                                         "Provider Last Name": "Smith"})
+        assert found["Role"] == "Founder"
 
 
 class TestReadSite:
@@ -232,6 +333,7 @@ class TestCollectionRecordsEvidence:
 class SiteFindingEmailEngine(FakeEmailEngine):
     def find_email(self, lead):
         lead["Website"] = SITE
+        lead["Role"] = "Owner"
         facts, text = site_audit.read_homepage(fixture("site_modern.html"), SITE)
         lead.update(site_audit.columns(facts, text))
         lead["Email"] = ""
@@ -248,6 +350,17 @@ class TestFindEmailsRecordsEvidence:
         saved = next(store.iter_leads())
         assert saved["Website"] == SITE
         assert site_audit.load_facts(saved["Site Facts"])["viewport"] is True
+        assert saved["Role"] == "Owner", "the role the scrape found is kept"
+
+    def test_facts_already_recorded_are_not_overwritten(self, store):
+        listed_none = site_audit.dump_facts(site_audit.no_site_facts("none_listed"))
+        store.add_leads_batch([{"NPI Number": "1111111111", "State": "TX",
+                                "Source": "Psychology Today", "Phone": "(512) 471-3300",
+                                "Site Facts": listed_none, "Site Checked": "2026-10-01"}])
+        pipeline = build(store, email_engine=SiteFindingEmailEngine())
+        pipeline.find_missing_emails()
+        saved = next(store.iter_leads())
+        assert saved["Site Facts"] == listed_none
 
 
 import threading  # noqa: E402

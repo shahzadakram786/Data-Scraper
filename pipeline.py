@@ -666,8 +666,14 @@ class LeadPipeline:
         enriched = self.email_engine.find_email(working)
         updates = {}
         for key in ("Email", "Website", "LinkedIn", "Facebook", "Instagram",
-                    "Other Social", "Site Facts", "Site Text", "Site Checked"):
+                    "Other Social", "Role", "Site Facts", "Site Text", "Site Checked"):
             value = enriched.get(key)
+            if key == "Role" and lead.get("Role"):
+                continue  # the role collection found stands
+            if key.startswith("Site ") and lead.get("Site Facts"):
+                # Facts already on file came from the provider's own listing
+                # or a site read; a search-found site does not replace them.
+                continue
             if value and value != lead.get(key):
                 updates[key] = value
 

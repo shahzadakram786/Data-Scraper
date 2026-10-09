@@ -168,13 +168,20 @@ def lead_type_selection(value, logger, config_path=None):
     """The --lead-types flag as a lead_types.Selection, or None after logging
     why it can't be used.
 
-    No flag, or "all", is no filter. An unknown or switched-off type is an
-    error that lists the valid ones — never a silent "no filter", which would
-    export everyone or, worse, email them.
+    No flag, or "all", is no filter. A flag that names nothing (an unset
+    shell variable), or an unknown or switched-off type, is an error that
+    lists the valid ones — never a silent "no filter", which would export
+    everyone or, worse, email them.
     """
     types = lead_types.load(config.lead_types_path(config_path), logger).types
+    if value is None:
+        return lead_types.Selection(types)
     wanted = lead_types.parse_list(value)
-    if not wanted or [w.lower() for w in wanted] == ["all"]:
+    if not wanted:
+        logger.error("--lead-types was given but names no lead type. Name one or "
+                     "more, or use --lead-types all for no filter.")
+        return None
+    if [w.lower() for w in wanted] == ["all"]:
         return lead_types.Selection(types)
     ids, unknown = lead_types.resolve(wanted, types)
     switched_off = [t.name for t in types if t.id in ids and not t.enabled]

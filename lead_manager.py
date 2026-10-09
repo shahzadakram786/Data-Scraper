@@ -614,6 +614,7 @@ class GoogleSheetsExporter:
                 sheet_key=sheet_name, min_score=min_score,
                 email_statuses=email_statuses), lead_types)
             if not leads:
+                self._empty_tab(sheet_name)
                 continue
             worksheet = self._worksheet_for(sheet_name, len(leads))
             values = [list(EXPORT_LAYOUT)]
@@ -641,6 +642,19 @@ class GoogleSheetsExporter:
         if changed:
             self.logger.info("Kept what was typed into the Google Sheet for %d leads.",
                              changed)
+
+    def _empty_tab(self, sheet_name):
+        """A tab with nothing to show this time is left with just its header.
+        Unlike a workbook, a Google Sheet's tabs persist between exports, and
+        a tab that kept the last export's rows would show leads the current
+        filter excluded."""
+        import gspread
+        try:
+            worksheet = self.spreadsheet.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            return
+        worksheet.clear()
+        worksheet.update([list(EXPORT_LAYOUT)], "A1", value_input_option="USER_ENTERED")
 
     def _worksheet_for(self, sheet_name, row_count):
         import gspread

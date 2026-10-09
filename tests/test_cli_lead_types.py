@@ -104,6 +104,18 @@ class TestExportFlag:
         assert any("website_development" in m for m in logger.messages), \
             "the error lists the valid ones"
 
+    @pytest.mark.parametrize("value", ["", " , "])
+    def test_an_empty_flag_is_refused_not_read_as_everyone(self, setup, logger, value):
+        """`send --send --lead-types "$TYPES"` with $TYPES unset must not email
+        every eligible lead."""
+        settings, tmp_path = setup
+        out = tmp_path / "out.xlsx"
+        code = run(["export", "--excel", str(out), "--lead-types", value],
+                   settings, logger, tmp_path)
+        assert code == cli.EXIT_FAILED
+        assert not out.exists()
+        assert any("all" in m for m in logger.messages), "says how to ask for no filter"
+
     def test_switched_off_lead_type_is_refused(self, setup, logger):
         settings, tmp_path = setup
         types = lead_types.builtin_types()

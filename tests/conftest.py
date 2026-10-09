@@ -39,6 +39,9 @@ def healthy_site_facts(today=None, **overrides):
         "favicon": True, "share_image": True, "video": True, "live_chat": ["tawk"],
         "images": 4, "images_missing_alt": 0, "wordpress_version": None,
         "builder": "",
+        # Read by the collection scrape, which also looks for the role and
+        # social links. A Check websites read does not.
+        "contact_scraped": True,
     })
     facts.update(overrides)
     return facts

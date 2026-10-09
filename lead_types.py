@@ -151,16 +151,30 @@ def _social_links(ev):
             if str(ev.lead.get(column) or "").strip()]
 
 
+def _contact_scraped(ev):
+    """Whether the read that produced these facts also looked for the role and
+    social links (the collection scrape does; a Check websites read does not)."""
+    return bool(ev.facts.get("contact_scraped"))
+
+
 def _no_social_profiles(ev):
     if not ev.site_read:
         return None, ""
-    return (not _social_links(ev)), "no social profiles"
+    if _social_links(ev):
+        return False, ""
+    if not _contact_scraped(ev):
+        return None, ""   # nobody looked for them
+    return True, "no social profiles"
 
 
 def _one_social_platform(ev):
     if not ev.site_read:
         return None, ""
     links = _social_links(ev)
+    if len(links) > 1:
+        return False, ""
+    if not _contact_scraped(ev):
+        return None, ""   # one is known; nobody looked for others
     if len(links) != 1:
         return False, ""
     column, url = links[0]
@@ -191,9 +205,10 @@ def _outdated_wordpress(ev):
 
 
 def _role_unknown(ev):
-    """Role is only ever found on a practice's own site. Empty with no site
-    read means nobody has looked — not "not the owner"."""
-    return not ev.role and not ev.site_read
+    """Role is only ever found by scraping a practice's own site for it. Empty,
+    unless such a scrape ran and found nothing, means nobody has looked — not
+    "not the owner"."""
+    return not ev.role and not (ev.site_read and _contact_scraped(ev))
 
 
 def _owner_answers_phone(ev):
