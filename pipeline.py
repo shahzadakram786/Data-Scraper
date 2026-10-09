@@ -20,6 +20,9 @@ import site_audit
 import outreach
 import verification
 from errors import ScraperError
+# The constants, not the module: recipients_for's `lead_types` parameter would
+# shadow a module of the same name.
+from lead_types import MATCH, NOT_CHECKED
 from storage import LeadStore, RUN_OK, RUN_EMPTY, RUN_STOPPED, RUN_FAILED
 from datetime import datetime, timezone
 
@@ -681,6 +684,95 @@ class LeadPipeline:
             self.attach_verification(updates, person_name=person or lead.get("Organization Name"))
         return updates
 
+    def check_sites(self, recheck=False):
+        """Read the homepage of every lead with a website nobody has read yet,
+        and record what it shows for lead types — one request per lead.
+
+        Leads collected before lead types existed have websites but no facts,
+        and NPI leads get their website from Find Emails. A read that says
+        nothing about the practice (timeout, bot protection, this connection)
+        is not recorded, so the next run tries it again.
+        """
+        run_id = self.store.start_run("site_check", "recheck" if recheck else "new only")
+        if recheck:
+            pending = [lead for lead in self.store.iter_leads() if lead.get("Website")]
+        else:
+            pending = list(self.store.iter_leads(needs_site_check=True))
+        if not pending:
+            self.reporter.log("Every lead with a website has already been checked.")
+            return self._finish(run_id, RUN_OK, 0, "Nothing to do.")
+
+        self.reporter.phase(
+            "Checking {0} websites for lead-type evidence...".format(len(pending)))
+        total = len(pending)
+        done = checked = no_site = broken = retry = 0
+        stopped = False
+
+        with ThreadPoolExecutor(max_workers=self.EMAIL_WORKERS) as executor:
+            futures = {executor.submit(self.email_engine.read_site, lead["Website"]): lead
+                       for lead in pending}
+            for future in as_completed(futures):
+                if self.reporter.stopped():
+                    stopped = True
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                lead = futures[future]
+                done += 1
+                try:
+                    facts, text = future.result()
+                except Exception as e:
+                    self.reporter.log("Could not read {0}: {1}".format(
+                        lead.get("Website"), e), "warning")
+                    facts, text = None, ""
+                updates = site_audit.columns(facts, text)
+                if not updates:
+                    retry += 1
+                else:
+                    self.store.update_lead(lead["_id"], updates)
+                    checked += 1
+                    if facts.get("own_site") is False:
+                        no_site += 1
+                    elif facts.get("fetch") != site_audit.FETCH_OK:
+                        broken += 1
+                self.reporter.progress(done, total)
+
+        if checked:
+            message = ("Checked {0} websites: {1} read, {2} only a directory or "
+                       "marketplace profile, {3} down or broken.".format(
+                           checked, checked - no_site - broken, no_site, broken))
+        else:
+            message = ("None of the {0} websites could be read just now — they timed "
+                       "out, turned the app away, or this connection dropped. They "
+                       "will be tried again next run.".format(done))
+        self.reporter.log(message)
+        if retry and checked:
+            self.reporter.log(
+                "{0} websites couldn't be reached right now; they will be tried "
+                "again next run.".format(retry), "warning")
+        status = RUN_STOPPED if stopped else self._guard_empty(checked, RUN_OK)
+        return self._finish(run_id, status, checked, message)
+
+    def lead_type_summary(self, selection, since):
+        """One line on how the leads created since `since` fit the chosen lead
+        types, for the end of a collection run. Empty when nothing is chosen."""
+        if selection is None or not selection.active:
+            return ""
+        leads = list(self.store.iter_leads(created_since=since))
+        if not leads:
+            return ""
+        matched = unknown = 0
+        for lead in leads:
+            status = selection.judge(lead).status
+            if status == MATCH:
+                matched += 1
+            elif status == NOT_CHECKED:
+                unknown += 1
+        line = "{0} of {1} new leads need {2}.".format(matched, len(leads), selection.label())
+        if unknown:
+            line += (" {0} can't be judged yet — Enrich → Check websites (and Find "
+                     "emails, for NPI leads) fills in what is missing.".format(unknown))
+        return line
+
     def verify_emails(self, recheck=False):
         """Check every recorded address against its domain's mail server."""
         if not self.verifier:
@@ -994,12 +1086,16 @@ class LeadPipeline:
         return {"Phone Verified": storage.PHONE_DIFFERS}
 
     def recipients_for(self, limit=50, icp_only=False, owners_only=False,
-                       states=None, allow_unverified=False, skip_contacted=True):
+                       states=None, allow_unverified=False, skip_contacted=True,
+                       lead_types=None):
         """Who a campaign would actually go to, and why the rest were left out.
 
         Returns (recipients, excluded) where excluded is a {reason: count} tally
         — shown before sending, because "50 of 534" is alarming until you can
         see that 255 simply have no email address.
+
+        lead_types (a lead_types.Selection) keeps only the leads that need what
+        was chosen, and counts the rest in `excluded` by why.
         """
         excluded = {}
 
@@ -1021,6 +1117,15 @@ class LeadPipeline:
                 drop("no email address")
                 continue
             email_key = email.lower()
+
+            if lead_types is not None and lead_types.active:
+                fit = lead_types.judge(lead).status
+                if fit == NOT_CHECKED:
+                    drop("can't tell yet whether they need " + lead_types.label())
+                    continue
+                if fit != MATCH:
+                    drop("doesn't need " + lead_types.label())
+                    continue
 
             status = str(lead.get("Email Status") or "").strip().lower()
             if status in outreach.NEVER_SEND_STATUSES:
@@ -1047,7 +1152,7 @@ class LeadPipeline:
     def send_campaign(self, subject_template, body_template, campaign="",
                       limit=50, daily_cap=50, icp_only=False, owners_only=False,
                       states=None, allow_unverified=False, dry_run=False,
-                      min_seconds=45, max_seconds=90):
+                      min_seconds=45, max_seconds=90, lead_types=None):
         """Send one campaign, slowly, to people who have not heard from you.
 
         Refuses to start if the compliance settings are incomplete: commercial
@@ -1084,7 +1189,7 @@ class LeadPipeline:
         effective_limit = min(limit, remaining_today) if not dry_run else limit
         recipients, excluded = self.recipients_for(
             limit=effective_limit, icp_only=icp_only, owners_only=owners_only,
-            states=states, allow_unverified=allow_unverified)
+            states=states, allow_unverified=allow_unverified, lead_types=lead_types)
 
         for reason, count in sorted(excluded.items(), key=lambda kv: -kv[1]):
             self.reporter.log("  {0} skipped — {1}".format(count, reason))

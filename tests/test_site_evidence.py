@@ -248,3 +248,140 @@ class TestFindEmailsRecordsEvidence:
         saved = next(store.iter_leads())
         assert saved["Website"] == SITE
         assert site_audit.load_facts(saved["Site Facts"])["viewport"] is True
+
+
+import threading  # noqa: E402
+from datetime import date  # noqa: E402
+
+import lead_types  # noqa: E402
+import storage  # noqa: E402
+from conftest import healthy_site_facts  # noqa: E402
+from storage import RUN_EMPTY, RUN_STOPPED  # noqa: E402
+
+TODAY = date(2026, 10, 9)
+
+
+class SiteReader:
+    """Stands in for EmailEngine.read_site: answers by URL."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    def read_site(self, url):
+        self.calls.append(url)
+        answer = self.answers[url]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def sites_pipeline(store, answers, reporter=None):
+    return LeadPipeline(store=store, npi_engine=None, email_engine=SiteReader(answers),
+                        pt_engine=None, reporter=reporter or Reporter())
+
+
+def site_lead(npi, website="", **fields):
+    row = {"NPI Number": npi, "State": "TX", "Source": "Psychology Today",
+           "Phone": "(512) 471-33{0}".format(npi[-2:]), "Website": website}
+    row.update(fields)
+    return row
+
+
+class TestCheckWebsites:
+
+    def seed(self, store):
+        store.add_leads_batch([
+            site_lead("1111111111", "https://a.example"),
+            site_lead("2222222222", "https://b.example", **{
+                "Site Checked": "2026-10-01",
+                "Site Facts": site_audit.dump_facts(healthy_site_facts(TODAY))}),
+            site_lead("3333333333"),
+        ])
+
+    def test_reads_every_website_nobody_has_read(self, store):
+        self.seed(store)
+        pipeline = sites_pipeline(store, {
+            "https://a.example": (healthy_site_facts(TODAY, viewport=False), "hello")})
+        result = pipeline.check_sites()
+        assert result.status == RUN_OK and result.added == 1
+        assert pipeline.email_engine.calls == ["https://a.example"]
+        saved = next(l for l in store.iter_leads() if l["NPI Number"] == "1111111111")
+        assert site_audit.load_facts(saved["Site Facts"])["viewport"] is False
+
+    def test_recheck_reads_them_all_again(self, store):
+        self.seed(store)
+        reading = (healthy_site_facts(TODAY), "")
+        pipeline = sites_pipeline(store, {"https://a.example": reading,
+                                          "https://b.example": reading})
+        assert pipeline.check_sites(recheck=True).added == 2
+
+    def test_a_timeout_is_not_recorded_and_is_tried_again(self, store):
+        self.seed(store)
+        pipeline = sites_pipeline(store, {
+            "https://a.example": (site_audit.base_facts(True, "timeout"), "")})
+        result = pipeline.check_sites()
+        assert result.status == RUN_EMPTY and result.added == 0
+        assert store.pending_counts()["needs_site_check"] == 1
+
+    def test_a_reader_crash_is_a_retry_not_a_failed_run(self, store):
+        self.seed(store)
+        pipeline = sites_pipeline(store, {"https://a.example": RuntimeError("boom")})
+        assert pipeline.check_sites().status == RUN_EMPTY
+
+    def test_nothing_to_do(self, store):
+        store.add_leads_batch([site_lead("3333333333")])
+        result = sites_pipeline(store, {}).check_sites()
+        assert result.status == RUN_OK and result.message == "Nothing to do."
+
+    def test_stop_is_honoured(self, store):
+        self.seed(store)
+        stop = threading.Event()
+        stop.set()
+        pipeline = sites_pipeline(store, {"https://a.example": (healthy_site_facts(TODAY), "")},
+                                  reporter=Reporter(stop_event=stop))
+        assert pipeline.check_sites().status == RUN_STOPPED
+
+
+class TestCampaignsByLeadType:
+
+    def test_recipients_are_only_leads_that_need_it(self, store):
+        no_site = site_audit.dump_facts(site_audit.no_site_facts("none_listed", today=TODAY))
+        healthy = site_audit.dump_facts(healthy_site_facts(TODAY))
+        store.add_leads_batch([
+            site_lead("1111111111", Email="a@a.example", **{"Email Status": "valid",
+                                                           "Site Facts": no_site}),
+            site_lead("2222222222", Email="b@b.example", **{"Email Status": "valid",
+                                                           "Site Facts": healthy}),
+            site_lead("3333333333", Email="c@c.example", **{"Email Status": "valid"}),
+        ])
+        pipeline = sites_pipeline(store, {})
+        selection = lead_types.Selection(lead_types.builtin_types(),
+                                         ["website_development"], today=TODAY)
+        recipients, excluded = pipeline.recipients_for(limit=0, lead_types=selection)
+        assert [r["NPI Number"] for r in recipients] == ["1111111111"]
+        assert excluded == {"doesn't need Website Development": 1,
+                            "can't tell yet whether they need Website Development": 1}
+
+
+class TestRunSummary:
+
+    def test_how_this_runs_leads_fit_the_selection(self, store):
+        since = storage.utcnow()
+        store.add_leads_batch([
+            site_lead("1111111111", **{"Site Facts": site_audit.dump_facts(
+                site_audit.no_site_facts("none_listed", today=TODAY))}),
+            site_lead("2222222222", **{"Site Facts": site_audit.dump_facts(
+                healthy_site_facts(TODAY))}),
+            site_lead("3333333333"),
+        ])
+        selection = lead_types.Selection(lead_types.builtin_types(),
+                                         ["website_development"], today=TODAY)
+        summary = sites_pipeline(store, {}).lead_type_summary(selection, since)
+        assert summary.startswith("1 of 3 new leads need Website Development.")
+        assert "1 can't be judged yet" in summary
+
+    def test_no_selection_no_summary(self, store):
+        store.add_leads_batch([site_lead("1111111111")])
+        selection = lead_types.Selection(lead_types.builtin_types())
+        assert sites_pipeline(store, {}).lead_type_summary(selection, "2000-01-01") == ""
