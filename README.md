@@ -163,7 +163,7 @@ All Emails Found · Role · LinkedIn · Facebook · Instagram · Other Social
 
 followed by what this tool adds: `Gender`, `NPI Phone`, `Phone Verified`,
 `Email Status`, `Email Confidence`, `Lead Score`, `Practice Size`,
-`Annual Billing`, `Medicare Paid`, `Patient Volume`, `First Seen`.
+`Annual Billing`, `Medicare Paid`, `Patient Volume`, `First Seen`, `Lead Types`.
 
 **What you type is kept.** `Outreach Status`, `Comments`, `Date` and the unnamed
 column are read back out of the existing workbook (or Google Sheet) before each
@@ -213,6 +213,53 @@ reachable decision-makers on top:
 
 Ties on score break by billing volume, so among equally contactable leads the
 bigger practice comes first.
+
+---
+
+## Lead types
+
+Pick the services you sell, and the export, Call List and campaigns narrow to
+the practices that show signs of needing them. Each match says why.
+
+| Lead type | Matches when… |
+| :--- | :--- |
+| Website Development | No website of their own · no mobile layout · copyright 4+ years old · site down |
+| SEO | No page title or meta description · no H1 · no schema.org business data |
+| Web Accessibility (ADA) | No accessibility statement · most images lack alt text |
+| IT Support & Security | No HTTPS · WordPress older than 6.0 · SSL error |
+| Digital Marketing / Paid Ads | No analytics tag / no ad tracking pixel |
+| Social Media | No social profiles, or only one |
+| Email Marketing / Content Writing / Video | No newsletter signup / no blog / no video |
+| Graphic Design & Branding | No logo, favicon or share image |
+| Software Development | No online booking **and** no client portal **and** no contact form |
+| Online Booking / Live Chat | No booking widget / no chat widget |
+| Virtual Assistant / Answering | *Good fit:* the owner answers their own line |
+| Bookkeeping / Accounting & Tax / Payroll & HR | *Good fit:* owner-operated small practice · $100k+ Medicare billing · 2–25 clinicians |
+| Medical Billing (RCM) | The ICP rule below, unchanged |
+| Legal & Compliance | No privacy policy, HIPAA notice or terms of use |
+
+**Where the evidence comes from.** The practice's homepage, read once, while
+Psychology Today collection is fetching it anyway for the email and phone, so
+it costs no extra requests. NPI leads have no website until **Find emails**
+finds one. **Enrich → Check websites** (`python cli.py enrich-sites`) reads the
+homepage of any lead with a website nobody has checked.
+
+**"Not checked" is not "needs it".** A lead nobody could inspect is counted and
+reported, never quietly included or left out. A timeout, a site's bot
+protection, or this machine's own dropped connection is never recorded as a
+site being down. The "good fit" types are worded as fit, not need: no public
+page says whether a practice already has a bookkeeper.
+
+**Matches are worked out when you export, never stored**, so switching from SEO
+to Bookkeeping, or editing a type in **Settings → Lead Types**, changes the
+next export without scraping again. Types live in `lead_types.json` beside
+`config.json`.
+
+```bash
+python cli.py lead-types                                   # list them
+python cli.py export --lead-types "website_development,seo"
+python cli.py send --template pitch.txt --lead-types seo   # dry run
+```
 
 ---
 
@@ -418,6 +465,8 @@ python cli.py find-emails                             # second pass for blanks
 python cli.py verify                                  # check every address
 python cli.py enrich-npi                              # NPI phone + gender
 python cli.py enrich-cms                              # billing volume + practice size
+python cli.py enrich-sites                            # homepage evidence for lead types
+python cli.py lead-types                              # what each lead type checks
 python cli.py send --template pitch.txt --icp         # dry run; add --send to deliver
 python cli.py suppress --add someone@practice.com     # never contact again
 python cli.py export --min-score 40                   # only the good ones
@@ -544,6 +593,9 @@ service-account **path** is stored, never the key itself.
 | `psychology_today_engine.py` | Directory scraping, region-block relay. |
 | `npi_engine.py` | NPI registry lookups. |
 | `email_engine.py` | Website scraping, phone/role/social extraction, search. |
+| `site_audit.py` | What a practice's homepage shows: the facts lead types are decided from. |
+| `lead_types.py` | The lead-type catalog, its checks, and matching. |
+| `ui_lead_types.py` | The lead-type picker, the pills on each screen, and the Settings editor. |
 | `cms_engine.py` | Medicare billing volume, practice size, federally-filed phones. |
 | `outreach.py` | Mail merge, CAN-SPAM footer, throttling, bounce classification. |
 | `health.py` | The ten-second "is everything still working?" check. |

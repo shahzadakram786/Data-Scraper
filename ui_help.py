@@ -40,6 +40,11 @@ HELP = {
             "Pick one source, set the filters, and press the button at the "
             "bottom. Leads are saved as they are found — you can stop at any "
             "time without losing anything.",
+            "Above the options, “What kind of leads do you need?” narrows the "
+            "result to practices that show signs of needing what you sell — a "
+            "website, SEO, bookkeeping and so on. Nothing chosen means every "
+            "lead, as before. Everything collected is kept either way; the "
+            "choice decides what the export and the Call List show.",
             ("list", [
                 "Psychology Today — therapists and counsellors. The richest "
                 "source: it follows each provider's own website for their "
@@ -61,7 +66,7 @@ HELP = {
     "enrich": (
         "Filling in what collection missed",
         [
-            "Four passes. Run them top to bottom; each one uses what the one "
+            "Five passes. Run them top to bottom; each one uses what the one "
             "before it found.",
             ("list", [
                 "Find missing emails — searches the practice's own website, "
@@ -74,6 +79,9 @@ HELP = {
                 "guessed when there is no confident match.",
                 "Medicare data — annual billing, practice size, and the phone "
                 "number the provider filed federally.",
+                "Check websites — reads each practice's homepage once so lead "
+                "types can be matched. Run it after Find emails, and once for "
+                "leads collected before lead types existed.",
             ]),
             ("warn", "Verify is what stops you emailing addresses that bounce. "
                      "Bounces are the fastest way to get a sending domain "
@@ -125,6 +133,9 @@ HELP = {
                 "than having no address at all.",
                 "Email Status colours here match the colours in the "
                 "spreadsheet, so the two read the same way.",
+                "Lead Types (the last column) says which services each practice "
+                "looks like it needs, and why. “Not checked” counts leads the app "
+                "can't judge yet — usually ones whose website nobody has read.",
             ]),
             ("tip", "Tick “Owner-operated small practices only” to narrow the "
                     "Call List to the practices that actually buy outsourced "
@@ -144,6 +155,8 @@ HELP = {
                 "otherwise; the app routes around the region block on its own.",
                 "Your mail password is stored in the Windows Credential "
                 "Manager, never in a file in this folder.",
+                "Lead Types — switch a service off to hide it, rename it, or add "
+                "your own from the same checks plus words on the homepage.",
             ]),
             ("warn", "A postal address and an unsubscribe address are required "
                      "by US law in commercial email. Sending stays blocked "

@@ -99,6 +99,19 @@ what to do. Don't start a long run until it's green.
 
 Go to the **1. Collect** tab and pick one of three sources.
 
+### Choosing what kind of leads you need
+
+Under **What kind of leads do you need?**, press **Choose lead types…** and tick
+the services you sell: Website Development, SEO, Bookkeeping, Legal &
+Compliance, and so on. The export and the Call List then show only practices
+that look like they need one of them, each with the reason in the **Lead
+Types** column. Leave it empty for every lead.
+
+Everything you collect is kept whatever you choose, so you can switch to a
+different service later and re-export from **Results** without collecting
+again. To change what a lead type looks for, or add your own, go to
+**Settings → Lead Types**.
+
 ### Psychology Today — the main source
 
 Best for therapists, counsellors and psychologists.
@@ -134,7 +147,7 @@ type.
 
 ## 4. Enriching what you collected
 
-Go to **2. Enrich**. Four passes, run them in this order. Each one tells you
+Go to **2. Enrich**. Five passes, run them in this order. Each one tells you
 how much work is waiting.
 
 ### a. Find missing email addresses
@@ -175,6 +188,14 @@ with Medicare.
 **Only Medicare-enrolled providers appear.** Expect roughly a third of
 NPI/ZocDoc leads and very few therapists. **A blank here is not a bad lead** —
 most therapists are cash-pay and never appear in Medicare data at all.
+
+### e. Check websites for lead-type evidence
+
+Reads each practice's homepage once (mobile layout, analytics, booking, privacy
+policy and the rest) so lead types can be matched. Run it after **Find
+emails**, which is where NPI leads get their website, and once for any leads you
+collected before lead types existed. Sites that time out or turn the app away
+aren't recorded; they're tried again next time.
 
 ---
 
