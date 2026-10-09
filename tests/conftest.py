@@ -24,6 +24,26 @@ def fixture(name):
         return handle.read()
 
 
+def healthy_site_facts(today=None, **overrides):
+    """Facts for a homepage that was read and lacks nothing any lead type
+    looks for. Tests take one thing away and watch exactly one type light up."""
+    import site_audit
+    facts = site_audit.base_facts(True, site_audit.FETCH_OK, 200, today)
+    facts.update({
+        "https": True, "viewport": True, "copyright_year": 2025, "title": True,
+        "meta_description": True, "h1": True, "schema_org": True,
+        "analytics": ["google-analytics"], "ad_pixels": ["meta"],
+        "booking": ["simplepractice"], "portal": True, "contact_form": True,
+        "newsletter": ["mailchimp"], "blog": True, "privacy_policy": True,
+        "hipaa_notice": True, "terms": True, "accessibility": True, "logo": True,
+        "favicon": True, "share_image": True, "video": True, "live_chat": ["tawk"],
+        "images": 4, "images_missing_alt": 0, "wordpress_version": None,
+        "builder": "",
+    })
+    facts.update(overrides)
+    return facts
+
+
 @pytest.fixture(autouse=True)
 def isolated_network_memory(tmp_path, monkeypatch):
     """Keep every test away from the real .cache/network.json, and from anything
