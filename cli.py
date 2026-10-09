@@ -7,6 +7,9 @@
     python cli.py find-emails
     python cli.py verify
     python cli.py export --min-score 40
+    python cli.py enrich-sites
+    python cli.py lead-types
+    python cli.py export --lead-types "website_development,seo"
     python cli.py stats
 
 This is what makes the tool schedulable: a nightly `collect-pt` on one state
@@ -24,6 +27,7 @@ import config
 import catalog
 import outreach
 import health
+import lead_types
 import storage
 from storage import LeadStore, RUN_OK, RUN_EMPTY, RUN_STOPPED, RUN_FAILED
 from pipeline import LeadPipeline, Reporter
@@ -134,8 +138,14 @@ def migrate_if_needed(store, settings, logger):
 
 
 def export(store, settings, logger, min_score=None, statuses=None,
-           call_list=100, icp_only=False):
-    """Render the database to whichever destination is configured."""
+           call_list=100, icp_only=False, selection=None):
+    """Render the database to whichever destination is configured.
+
+    `selection` is a lead_types.Selection. None means no filter, with the
+    Lead Types column still filled in.
+    """
+    if selection is None:
+        selection = lead_type_selection(None, logger)
     if settings.get("output") == "google":
         credentials = settings.get("google_credentials")
         if not credentials or not os.path.exists(credentials):
@@ -148,8 +158,35 @@ def export(store, settings, logger, min_score=None, statuses=None,
     else:
         exporter = ExcelExporter(settings.get("excel_path"), logger=logger)
         return exporter.export(store, min_score=min_score, email_statuses=statuses,
-                               call_list=call_list, call_list_icp=icp_only)
-    return exporter.export(store, min_score=min_score, email_statuses=statuses)
+                               call_list=call_list, call_list_icp=icp_only,
+                               lead_types=selection)
+    return exporter.export(store, min_score=min_score, email_statuses=statuses,
+                           lead_types=selection)
+
+
+def lead_type_selection(value, logger, config_path=None):
+    """The --lead-types flag as a lead_types.Selection, or None after logging
+    why it can't be used.
+
+    No flag, or "all", is no filter. An unknown or switched-off type is an
+    error that lists the valid ones — never a silent "no filter", which would
+    export everyone or, worse, email them.
+    """
+    types = lead_types.load(config.lead_types_path(config_path), logger).types
+    wanted = lead_types.parse_list(value)
+    if not wanted or [w.lower() for w in wanted] == ["all"]:
+        return lead_types.Selection(types)
+    ids, unknown = lead_types.resolve(wanted, types)
+    switched_off = [t.name for t in types if t.id in ids and not t.enabled]
+    if unknown or switched_off:
+        if unknown:
+            logger.error("Unknown lead type(s): %s.", ", ".join(unknown))
+        if switched_off:
+            logger.error("Switched off in Settings: %s.", ", ".join(switched_off))
+        logger.error("Valid lead types: %s", ", ".join(
+            "{0} ({1})".format(t.id, t.name) for t in types if t.enabled))
+        return None
+    return lead_types.Selection(types, ids)
 
 
 def status_exit_code(result):
@@ -306,6 +343,10 @@ def cmd_send(args, settings, logger):
                      "template, or pass --subject.")
         return EXIT_FAILED
 
+    selection = lead_type_selection(args.lead_types, logger, args.config)
+    if selection is None:
+        return EXIT_FAILED
+
     reporter = ConsoleReporter(logger, quiet=args.quiet)
     pipeline = build_pipeline(settings, logger, reporter)
     result = pipeline.send_campaign(
@@ -313,6 +354,7 @@ def cmd_send(args, settings, logger):
         limit=args.limit, daily_cap=settings.get("daily_send_cap", 40),
         icp_only=args.icp, owners_only=args.owners_only,
         allow_unverified=args.allow_unverified,
+        lead_types=selection,
         dry_run=not args.send,
         min_seconds=settings.get("send_min_seconds", 45),
         max_seconds=settings.get("send_max_seconds", 90))
@@ -356,6 +398,33 @@ def cmd_enrich_npi(args, settings, logger):
     if settings.get("auto_export"):
         export(pipeline.store, settings, logger)
     return report_result(result, logger)
+
+
+def cmd_enrich_sites(args, settings, logger):
+    reporter = ConsoleReporter(logger, quiet=args.quiet)
+    pipeline = build_pipeline(settings, logger, reporter)
+    result = pipeline.check_sites(recheck=args.recheck)
+    if settings.get("auto_export"):
+        export(pipeline.store, settings, logger)
+    return report_result(result, logger)
+
+
+def cmd_lead_types(args, settings, logger):
+    loaded = lead_types.load(config.lead_types_path(args.config), logger)
+    if loaded.problem:
+        print(loaded.problem)
+        print()
+    for group, members in lead_types.grouped(loaded.types):
+        print(group)
+        for t in members:
+            rule = "all of" if t.match == "all" else "any of"
+            checks = ", ".join(
+                t.checks + ["mentions '{0}'".format(p) for p in t.mentions]
+                + ["doesn't mention '{0}'".format(p) for p in t.not_mentions])
+            print("  {0:<4}{1:<24}{2:<32}{3} {4}".format(
+                "on" if t.enabled else "off", t.id, t.name, rule, checks))
+        print()
+    return EXIT_OK
 
 
 def cmd_update(args, settings, logger):
@@ -405,8 +474,14 @@ def cmd_export(args, settings, logger):
     if args.google:
         settings["output"] = "google"
     statuses = [s.strip() for s in args.status.split(",")] if args.status else None
+    selection = lead_type_selection(args.lead_types, logger, args.config)
+    if selection is None:
+        return EXIT_FAILED
+    if selection.active:
+        logger.info("Lead types: %s", selection.label())
     written = export(store, settings, logger, min_score=args.min_score,
-                     statuses=statuses, call_list=args.call_list, icp_only=args.icp)
+                     statuses=statuses, call_list=args.call_list, icp_only=args.icp,
+                     selection=selection)
     return EXIT_OK if written else EXIT_EMPTY
 
 
@@ -527,6 +602,16 @@ def build_parser():
                             help="Look up leads that were already matched.")
     enrich_npi.set_defaults(func=cmd_enrich_npi)
 
+    enrich_sites = subparsers.add_parser(
+        "enrich-sites", help="Read each lead's homepage for lead-type evidence.")
+    enrich_sites.add_argument("--recheck", action="store_true",
+                              help="Read sites that were already checked, too.")
+    enrich_sites.set_defaults(func=cmd_enrich_sites)
+
+    lead_types_cmd = subparsers.add_parser(
+        "lead-types", help="List the lead types and what each one checks.")
+    lead_types_cmd.set_defaults(func=cmd_lead_types)
+
     send = subparsers.add_parser(
         "send", help="Send an outreach campaign (dry run unless --send).")
     send.add_argument("--template", required=True,
@@ -541,6 +626,9 @@ def build_parser():
     send.add_argument("--allow-unverified", action="store_true",
                       help="Include addresses that could not be verified. Raises "
                            "the bounce rate; bounces are suppressed automatically.")
+    send.add_argument("--lead-types",
+                      help='Only send to leads that need these, e.g. "seo,paid_ads" '
+                           '(IDs or names).')
     send.add_argument("--send", action="store_true",
                       help="Actually deliver. Without this it is a dry run.")
     send.set_defaults(func=cmd_send)
@@ -566,6 +654,10 @@ def build_parser():
     export_cmd.add_argument("--status",
                             help="Only export these email statuses, comma separated "
                                  "(e.g. valid,role).")
+    export_cmd.add_argument("--lead-types",
+                            help='Only leads that need these, e.g. '
+                                 '"website_development,seo" (IDs or names). '
+                                 '"all" for no filter.')
     export_cmd.set_defaults(func=cmd_export)
 
     update = subparsers.add_parser(
