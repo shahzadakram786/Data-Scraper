@@ -679,3 +679,74 @@ class TestLeadTypes:
         gui.store.add_leads_batch([lead(Phone="(512) 471-3300", Website="https://a.example")])
         gui.refresh(force=True)
         assert gui.step_sites.status.cget("text") == "1 to check"
+
+
+class TestLeadTypeSettings:
+
+    def card(self, gui):
+        gui.show("settings")
+        gui.root.update()
+        card = gui.lead_types_card
+        card._confirm = lambda *_a, **_k: True
+        return card
+
+    def test_every_lead_type_is_listed(self, gui):
+        card = self.card(gui)
+        assert len(card.tree.get_children()) == len(gui.lead_type_defs) == 20
+
+    def test_switching_a_type_off_is_saved(self, gui):
+        import config
+        import lead_types
+        card = self.card(gui)
+        card.tree.selection_set("seo")
+        card.toggle()
+        saved = lead_types.load(config.lead_types_path()).types
+        assert next(t for t in saved if t.id == "seo").enabled is False
+        assert next(t for t in gui.lead_type_defs if t.id == "seo").enabled is False
+
+    def test_built_ins_cannot_be_deleted(self, gui):
+        card = self.card(gui)
+        card.tree.selection_set("seo")
+        card.delete()
+        assert "not deleted" in card.message.cget("text")
+        assert len(gui.lead_type_defs) == 20
+
+    def test_adding_through_the_editor(self, gui):
+        import ui_lead_types as LT
+        card = self.card(gui)
+        editor = LT.LeadTypeEditor(card, None, card.types, on_save=card._added)
+        editor.name_var.set("Telehealth")
+        editor.mentions_var.set("telehealth, video sessions")
+        assert editor.save()
+        added = gui.lead_type_defs[-1]
+        assert (added.id, added.mentions) == ("telehealth", ["telehealth", "video sessions"])
+
+    def test_the_editor_lists_problems_instead_of_saving(self, gui):
+        import ui_lead_types as LT
+        card = self.card(gui)
+        editor = LT.LeadTypeEditor(card, None, card.types, on_save=card._added)
+        editor.name_var.set("SEO")
+        editor.check_vars["no_h1"].set(True)
+        assert editor.save() is False
+        assert "already called" in editor.problems.cget("text")
+        editor.destroy()
+
+    def test_deleting_a_selected_custom_type_drops_it_from_the_selection(self, gui):
+        import lead_types
+        card = self.card(gui)
+        card._added(lead_types.LeadType(id="telehealth", name="Telehealth",
+                                        mentions=["telehealth"]))
+        gui._set_lead_type_selection(["telehealth", "seo"])
+        card.tree.selection_set("telehealth")
+        card.delete()
+        assert gui.settings["lead_types_selected"] == ["seo"]
+
+    def test_a_broken_file_is_explained(self, gui):
+        import config
+        with open(config.lead_types_path(), "w", encoding="utf-8") as handle:
+            handle.write("{broken")
+        gui._load_lead_types()
+        gui.lead_types_card.show(gui.lead_type_defs, problem=gui.lead_types_problem)
+        gui.root.update()
+        assert ".bad" in gui.lead_types_card.note.cget("text")
+        assert gui.lead_types_card.note.winfo_manager()

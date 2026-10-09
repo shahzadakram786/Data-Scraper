@@ -1201,6 +1201,22 @@ class LeadGenApp:
                         variable=self.auto_export_var).grid(row=4, column=1,
                                                             sticky="w", pady=(8, 0))
 
+        # --- lead types
+        card = T.Card(page, padding=18)
+        card.pack(fill=tk.X, pady=(0, 12))
+        self._card_title(card.inner, "LEAD TYPES")
+        tk.Label(card.inner,
+                 text="What each service's buyer looks like. Switch a type off to "
+                      "hide it from the picker, or add your own from the same checks "
+                      "plus words on the practice's homepage. Saved to "
+                      "lead_types.json beside config.json.",
+                 font=T.F_SMALL, bg=T.SURFACE, fg=T.INK_FAINT, anchor="w",
+                 justify="left", wraplength=760).pack(fill=tk.X, pady=(0, 10))
+        self.lead_types_card = LT.LeadTypesCard(card.inner, on_save=self._save_lead_types)
+        self.lead_types_card.pack(fill=tk.X)
+        self.lead_types_card.show(self.lead_type_defs, counts=self.lead_type_counts,
+                                  problem=self.lead_types_problem)
+
         # --- accuracy
         card = T.Card(page, padding=18)
         card.pack(fill=tk.X, pady=(0, 12))
@@ -1770,6 +1786,25 @@ class LeadGenApp:
     def _set_lead_type_selection(self, ids):
         self.settings["lead_types_selected"] = list(ids)
         config.save(self.settings)
+        self._refresh_lead_type_bars()
+        self._recount_lead_types(force=True)
+
+    def _save_lead_types(self, types):
+        """Persist an edit from Settings, then redraw everything that shows
+        lead types. A deleted type leaves the selection."""
+        try:
+            lead_types.save(types, config.lead_types_path())
+        except OSError as e:
+            self.banner.set("error", "Could not save lead types.", str(e))
+            return
+        self.lead_type_defs = types
+        self.lead_types_problem = ""
+        kept = lead_types.prune_selection(self.settings.get("lead_types_selected") or [],
+                                          types, self.logger)
+        if kept != (self.settings.get("lead_types_selected") or []):
+            self.settings["lead_types_selected"] = kept
+            config.save(self.settings)
+        self.lead_types_card.show(types, problem="")
         self._refresh_lead_type_bars()
         self._recount_lead_types(force=True)
 
