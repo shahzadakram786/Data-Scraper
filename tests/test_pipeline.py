@@ -84,10 +84,17 @@ class FakePTEngine:
     # A provider who lists a website is the normal case, and it is the branch
     # that reads their contact details — so it is the default here. Pass
     # website="" to exercise the provider-has-no-site path.
-    def __init__(self, pages=None, raises=None, website="https://practice.example"):
+    def __init__(self, pages=None, raises=None, website="https://practice.example",
+                 website_outcome=None):
         self.pages = pages or []
         self.raises = raises
         self.website = website
+        # Psychology Today answers "no website" (404) outright, or the lookup
+        # fails ("unknown"). Only the first is evidence.
+        self.website_outcome = website_outcome or ("listed" if website else "none")
+
+    def lookup_website(self, pt_id):
+        return self.website, self.website_outcome
 
     def iter_listing(self, state, stop_event=None, max_pages=None, start_page=1):
         if self.raises:

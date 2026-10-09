@@ -40,6 +40,10 @@ class FakePT:
     def _resolve_website(self, pt_id):
         return "https://smithpsych.example" if pt_id == "1111111" else ""
 
+    def lookup_website(self, pt_id):
+        website = self._resolve_website(pt_id)
+        return website, ("listed" if website else "none")
+
     def get_profile_details(self, pt_id, url):
         return {"specialty": "", "website": self._resolve_website(pt_id)}
 

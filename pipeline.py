@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 import storage
+import site_audit
 import outreach
 import verification
 from errors import ScraperError
@@ -314,11 +315,12 @@ class LeadPipeline:
         # when the listing gave us no credential. Profile pages are geo-fenced,
         # so each one costs a relayed request.
         specialty = entry.get("credential", "")
-        website = self.pt_engine._resolve_website(entry["pt_id"])
+        website, website_outcome = self.pt_engine.lookup_website(entry["pt_id"])
         if not specialty:
             details = self.pt_engine.get_profile_details(entry["pt_id"], entry["profile_url"])
             specialty = details.get("specialty", "")
-            website = website or details.get("website", "")
+            if not website and details.get("website"):
+                website, website_outcome = details["website"], site_audit.WEBSITE_LISTED
 
         first_name, last_name = ("", "") if entry["is_org"] else self.split_pt_name(entry["name"])
 
@@ -345,6 +347,15 @@ class LeadPipeline:
 
         phone, phone_source = self.pick_authentic_phone(contact, entry)
         email_source = "Provider website" if email else ""
+
+        # What their homepage shows, for lead types. Psychology Today saying
+        # "no website" is evidence too; a lookup that failed is not.
+        if website:
+            site = site_audit.columns(contact.get("facts"), contact.get("text", ""))
+        elif website_outcome == site_audit.WEBSITE_NONE:
+            site = site_audit.columns(site_audit.no_site_facts(site_audit.NO_SITE_LISTED))
+        else:
+            site = {}
 
         if not email and website:
             # The practice has a domain but publishes no address. Ask its own
@@ -397,6 +408,7 @@ class LeadPipeline:
             # NPI details pass does not ask again.
             "NPI Checked": datetime.now(timezone.utc).date().isoformat(),
         }
+        lead.update(site)
         self.attach_verification(lead, person_name=entry.get("name"),
                                  note=email_source)
         return lead
@@ -651,7 +663,7 @@ class LeadPipeline:
         enriched = self.email_engine.find_email(working)
         updates = {}
         for key in ("Email", "Website", "LinkedIn", "Facebook", "Instagram",
-                    "Other Social"):
+                    "Other Social", "Site Facts", "Site Text", "Site Checked"):
             value = enriched.get(key)
             if value and value != lead.get(key):
                 updates[key] = value

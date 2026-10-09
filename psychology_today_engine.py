@@ -6,6 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 
 import http_pool
+import site_audit
 from errors import RegionBlockedError, ListingParseError, SourceUnavailableError
 
 
@@ -318,28 +319,35 @@ class PsychologyTodayEngine:
 
         return {"specialty": specialty, "website": self._resolve_website(pt_id)}
 
-    def _resolve_website(self, pt_id):
-        """Reads the provider's external website out of Psychology Today's own
-        "My website" interstitial.
+    def lookup_website(self, pt_id):
+        """(url, outcome) for the provider's own website, read out of
+        Psychology Today's "My website" interstitial.
 
         The page is a Nuxt app whose inlined payload carries the target URL with
-        every slash escaped. A 404 means the provider lists no website at all,
-        which is the cheapest possible signal — no profile page fetch needed to
-        find that out.
+        every slash escaped. outcome is site_audit.WEBSITE_LISTED (url is
+        theirs), WEBSITE_NONE (a 404: they list no website at all — the cheapest
+        possible signal, and real evidence for lead types) or WEBSITE_UNKNOWN
+        (the lookup failed, or the page held no usable link — evidence of
+        nothing).
         """
         try:
             resp = self.session.get(
                 self.WEBSITE_URL.format(pt_id=pt_id), timeout=15)
         except requests.RequestException as e:
             self.logger.warning(f"Could not resolve website for profile {pt_id}: {e}")
-            return ""
+            return "", site_audit.WEBSITE_UNKNOWN
         if resp.status_code == 404:
-            return ""  # provider lists no website
+            return "", site_audit.WEBSITE_NONE
         if resp.status_code != 200:
             self.logger.warning(
                 f"Website lookup for profile {pt_id} -> HTTP {resp.status_code}")
-            return ""
-        return self._first_external_url(resp.text)
+            return "", site_audit.WEBSITE_UNKNOWN
+        url = self._first_external_url(resp.text)
+        return (url, site_audit.WEBSITE_LISTED) if url else ("", site_audit.WEBSITE_UNKNOWN)
+
+    def _resolve_website(self, pt_id):
+        """Just the URL, for callers that don't need to know why it is blank."""
+        return self.lookup_website(pt_id)[0]
 
     @classmethod
     def _first_external_url(cls, html):

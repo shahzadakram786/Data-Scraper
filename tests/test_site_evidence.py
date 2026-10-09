@@ -147,3 +147,104 @@ class TestFindEmailRecordsTheSiteItFound:
         assert found["Website"] == SITE
         assert site_audit.load_facts(found["Site Facts"])["viewport"] is True
         assert found["Site Checked"]
+
+
+from storage import RUN_OK  # noqa: E402
+from pipeline import LeadPipeline, Reporter  # noqa: E402
+from test_pipeline import FakeEmailEngine, FakeNPIEngine, FakePTEngine, entry  # noqa: E402
+
+
+class PTResponse:
+    def __init__(self, status, text=""):
+        self.status_code = status
+        self.text = text
+
+
+class TestPsychologyTodayWebsiteLookup:
+
+    def answer(self, pt_engine, monkeypatch, response):
+        def get(url, **_kwargs):
+            if isinstance(response, Exception):
+                raise response
+            return response
+        monkeypatch.setattr(pt_engine.session, "get", get)
+
+    def test_a_404_means_no_website_listed(self, pt_engine, monkeypatch):
+        self.answer(pt_engine, monkeypatch, PTResponse(404))
+        assert pt_engine.lookup_website("123") == ("", site_audit.WEBSITE_NONE)
+
+    def test_a_server_error_says_nothing(self, pt_engine, monkeypatch):
+        self.answer(pt_engine, monkeypatch, PTResponse(500))
+        assert pt_engine.lookup_website("123") == ("", site_audit.WEBSITE_UNKNOWN)
+
+    def test_a_failed_request_says_nothing(self, pt_engine, monkeypatch):
+        self.answer(pt_engine, monkeypatch, requests.exceptions.ConnectTimeout("slow"))
+        assert pt_engine.lookup_website("123") == ("", site_audit.WEBSITE_UNKNOWN)
+
+    def test_a_listed_website(self, pt_engine, monkeypatch):
+        body = '{"url":"https:' + r"//" + "cedargrove.example" + r"/" + '"}'
+        self.answer(pt_engine, monkeypatch, PTResponse(200, body))
+        assert pt_engine.lookup_website("123") == \
+            ("https://cedargrove.example/", site_audit.WEBSITE_LISTED)
+        assert pt_engine._resolve_website("123") == "https://cedargrove.example/"
+
+    def test_a_page_with_no_usable_link_says_nothing(self, pt_engine, monkeypatch):
+        self.answer(pt_engine, monkeypatch, PTResponse(200, "<html>nothing</html>"))
+        assert pt_engine.lookup_website("123") == ("", site_audit.WEBSITE_UNKNOWN)
+
+
+def build(store, **engines):
+    return LeadPipeline(store=store,
+                        npi_engine=engines.get("npi_engine") or FakeNPIEngine(),
+                        email_engine=engines.get("email_engine") or FakeEmailEngine(),
+                        pt_engine=engines.get("pt_engine") or FakePTEngine(),
+                        reporter=Reporter())
+
+
+class TestCollectionRecordsEvidence:
+
+    def test_no_website_listed_is_recorded(self, store):
+        pipeline = build(store, pt_engine=FakePTEngine(pages=[(1, [entry()])], website=""))
+        pipeline.collect_psychology_today("Texas", "TX")
+        facts = site_audit.load_facts(next(store.iter_leads())["Site Facts"])
+        assert facts["own_site"] is False and facts["why"] == "none_listed"
+
+    def test_a_failed_lookup_records_nothing(self, store):
+        pipeline = build(store, pt_engine=FakePTEngine(
+            pages=[(1, [entry()])], website="", website_outcome="unknown"))
+        pipeline.collect_psychology_today("Texas", "TX")
+        assert not next(store.iter_leads())["Site Facts"]
+
+    def test_the_homepage_reading_is_kept(self, store):
+        facts, text = site_audit.read_homepage(fixture("site_modern.html"), SITE)
+        engine = FakeEmailEngine(contact={"email": "", "phone": "", "phone_confidence": "",
+                                          "role": "", "socials": {}, "facts": facts,
+                                          "text": text})
+        pipeline = build(store, pt_engine=FakePTEngine(pages=[(1, [entry()])]),
+                         email_engine=engine)
+        pipeline.collect_psychology_today("Texas", "TX")
+        saved = next(store.iter_leads())
+        assert site_audit.load_facts(saved["Site Facts"])["viewport"] is True
+        assert "Telehealth" in site_audit.unpack_text(saved["Site Text"])
+        assert saved["Site Checked"] == facts["checked"]
+
+
+class SiteFindingEmailEngine(FakeEmailEngine):
+    def find_email(self, lead):
+        lead["Website"] = SITE
+        facts, text = site_audit.read_homepage(fixture("site_modern.html"), SITE)
+        lead.update(site_audit.columns(facts, text))
+        lead["Email"] = ""
+        return lead
+
+
+class TestFindEmailsRecordsEvidence:
+
+    def test_the_site_it_found_is_recorded(self, store):
+        store.add_leads_batch([{"NPI Number": "1111111111", "State": "TX",
+                                "Source": "NPI Registry", "Phone": "(512) 471-3300"}])
+        pipeline = build(store, email_engine=SiteFindingEmailEngine())
+        pipeline.find_missing_emails()
+        saved = next(store.iter_leads())
+        assert saved["Website"] == SITE
+        assert site_audit.load_facts(saved["Site Facts"])["viewport"] is True
