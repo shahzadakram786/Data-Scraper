@@ -91,6 +91,13 @@ INTERNAL_COLUMNS = (
     # are legitimately blank for many leads, so an empty value cannot be what
     # means "not checked yet".
     ("NPI Checked", "npi_checked"),
+    # What the practice's homepage showed (site_audit), its visible text for
+    # keyword checks, and when it was read. Lead types are decided from these
+    # when leads are read and never stored, so editing a type needs no
+    # re-scrape.
+    ("Site Facts", "site_facts"),
+    ("Site Text", "site_text"),
+    ("Site Checked", "site_checked"),
 )
 
 # The spreadsheet's column order. It matches the working sheet this tool
@@ -109,10 +116,16 @@ EXPORT_LAYOUT = (
     "Email Status", "Email Confidence", "Lead Score",
     "Practice Size", "Annual Billing", "Medicare Paid", "Patient Volume",
     "First Seen",
+    # --- added with lead types: worked out at export time, never stored ---
+    "Lead Types",
 )
 
 # Export header -> stored field, where the two differ.
 EXPORT_FIELD = {"": "Extra"}
+
+# Export columns worked out when the sheet is written rather than stored:
+# Lead Types depends on the lead-type definitions at that moment.
+GENERATED_FIELDS = frozenset({"Lead Types"})
 
 # What a person types into the spreadsheet. Read back before every export
 # overwrites the file, so notes made while working the list survive the next
@@ -764,7 +777,8 @@ class LeadStore:
     def iter_leads(self, sheet_key=None, state=None, source=None,
                    missing_email=False, has_email=False, unverified=False,
                    needs_cms=False, needs_npi=False, min_score=None,
-                   email_statuses=None, order_by=None, limit=None):
+                   email_statuses=None, order_by=None, limit=None,
+                   needs_site_check=False, created_since=None):
         """Yields leads matching the filters, as header-keyed dicts.
 
         order_by takes a key from ORDERINGS ("best", "newest", "name", ...),
@@ -780,7 +794,8 @@ class LeadStore:
             sheet_key=sheet_key, state=state, source=source,
             missing_email=missing_email, has_email=has_email,
             unverified=unverified, needs_cms=needs_cms, needs_npi=needs_npi,
-            min_score=min_score, email_statuses=email_statuses)
+            min_score=min_score, email_statuses=email_statuses,
+            needs_site_check=needs_site_check, created_since=created_since)
 
         sql = "SELECT * FROM leads" + where + " ORDER BY " + order_clause
         if limit:
@@ -794,7 +809,8 @@ class LeadStore:
     @staticmethod
     def _filter_sql(sheet_key=None, state=None, source=None, missing_email=False,
                     has_email=False, unverified=False, needs_cms=False,
-                    needs_npi=False, min_score=None, email_statuses=None):
+                    needs_npi=False, min_score=None, email_statuses=None,
+                    needs_site_check=False, created_since=None):
         """The WHERE clause for a set of lead filters, as (sql, params).
 
         Shared by iter_leads, count and pending_counts, so listing leads and
@@ -834,11 +850,19 @@ class LeadStore:
             placeholders = ", ".join("?" * len(email_statuses))
             where.append("email_status IN (" + placeholders + ")")
             params.extend(email_statuses)
+        if needs_site_check:
+            # Leads with a website nobody has read yet. A read records the
+            # date; a transient failure records nothing, so it is tried again.
+            where.append("(website IS NOT NULL AND website != '')")
+            where.append("(site_checked IS NULL OR site_checked = '')")
+        if created_since:
+            where.append("created_at >= ?")
+            params.append(created_since)
         return ((" WHERE " + " AND ".join(where)) if where else ""), params
 
     def iter_best_leads(self, owners_only=False, require_email=False,
                         icp_only=False, max_practice_size=ICP_MAX_PRACTICE_SIZE,
-                        states=None, min_score=None):
+                        states=None, min_score=None, lead_types=None):
         """Lazily yield workable leads, best first, each with a `Why` line.
 
         Lazy because callers usually want the top 25 of several thousand:
@@ -848,7 +872,12 @@ class LeadStore:
         Filtering happens here rather than in SQL for `icp_only`, because the
         ICP test spans several columns and a couple of derived values, and the
         rule is worth keeping readable in one place.
+
+        `lead_types` is a lead_types.Selection. Only leads it admits come back,
+        and their Why line ends with what they need. It is taken by its shape
+        rather than imported, because lead_types imports this module.
         """
+        filtering = lead_types is not None and lead_types.active
         for lead in self.iter_leads(min_score=min_score, has_email=require_email):
             if states and lead.get("State") not in states:
                 continue
@@ -858,7 +887,13 @@ class LeadStore:
                 continue
             if not (lead.get("Email") or lead.get("Phone")):
                 continue  # nothing to contact them with
-            lead["Why"] = explain_lead(lead)
+            needs = ""
+            if filtering:
+                judgement = lead_types.judge(lead)
+                if not judgement.admitted:
+                    continue
+                needs = judgement.needs_line()
+            lead["Why"] = " · ".join(part for part in (explain_lead(lead), needs) if part)
             yield lead
 
     def best_leads(self, limit=100, **filters):
@@ -919,8 +954,9 @@ class LeadStore:
                 "SELECT COUNT(*) AS n FROM leads" + where, params).fetchone()
         return row["n"] if row else 0
 
-    # The four enrichment backlogs, in the order the passes run.
-    PENDING_FILTERS = ("missing_email", "unverified", "needs_npi", "needs_cms")
+    # The five enrichment backlogs, in the order the passes run.
+    PENDING_FILTERS = ("missing_email", "unverified", "needs_npi", "needs_cms",
+                       "needs_site_check")
 
     def pending_counts(self):
         """What each enrichment pass still has to do, in a single query.
@@ -1342,6 +1378,12 @@ class LeadStore:
 
 def _utcnow():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def utcnow():
+    """An ISO UTC timestamp in the format the leads table stores, for callers
+    that want "leads created since this moment"."""
+    return _utcnow()
 
 
 def _as_text(value):

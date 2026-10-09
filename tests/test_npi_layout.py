@@ -51,7 +51,13 @@ class TestLayout:
     def test_every_stored_field_is_exported_exactly_once(self):
         exported = [EXPORT_FIELD.get(h, h) for h in EXPORT_LAYOUT]
         assert len(exported) == len(set(exported))
-        assert sorted(exported) == sorted(storage.HEADERS)
+        stored = [field for field in exported if field not in storage.GENERATED_FIELDS]
+        assert sorted(stored) == sorted(storage.HEADERS)
+
+    def test_generated_columns_are_never_stored(self):
+        for field in storage.GENERATED_FIELDS:
+            assert field in EXPORT_LAYOUT
+            assert field not in storage.HEADER_TO_COLUMN
 
     def test_only_the_spare_column_is_unnamed(self):
         assert list(EXPORT_LAYOUT).count("") == 1

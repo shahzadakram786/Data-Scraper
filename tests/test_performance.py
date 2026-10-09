@@ -90,11 +90,13 @@ class TestCountingInTheDatabase:
             "unverified": 1,      # b@x.example
             "needs_npi": 4,       # all but the one already matched
             "needs_cms": 3,       # real NPIs not yet looked up; not the placeholder
+            "needs_site_check": 0,  # none of the seeded leads has a website
         }
 
     def test_an_empty_database_has_nothing_pending(self, store):
         assert store.pending_counts() == {
-            "missing_email": 0, "unverified": 0, "needs_npi": 0, "needs_cms": 0}
+            "missing_email": 0, "unverified": 0, "needs_npi": 0, "needs_cms": 0,
+            "needs_site_check": 0}
 
 
 # ---------------------------------------------------- the change fingerprint
