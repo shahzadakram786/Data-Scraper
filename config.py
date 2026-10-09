@@ -14,6 +14,9 @@ import logging
 
 CONFIG_FILE = "config.json"
 
+# The lead-type definitions (see lead_types.py), kept beside config.json.
+LEAD_TYPES_FILE = "lead_types.json"
+
 DEFAULTS = {
     # Storage and output
     "db_path": "leads.db",
@@ -71,6 +74,10 @@ DEFAULTS = {
     "owners_only": False,
     "exclude_corporate": True,
     "min_updated_year": 2010,
+
+    # Lead types: the IDs chosen in the window, shared by Collect, Results and
+    # Outreach. The definitions live in lead_types.json beside this file.
+    "lead_types_selected": [],
 }
 
 
@@ -95,6 +102,13 @@ def save(settings, path=CONFIG_FILE):
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(clean, handle, indent=2)
     return clean
+
+
+def lead_types_path(config_path=None):
+    """lead_types.json, beside config.json. Read CONFIG_FILE at call time, so
+    a test or the CLI pointing config elsewhere moves this with it."""
+    folder = os.path.dirname(os.path.abspath(config_path or CONFIG_FILE))
+    return os.path.join(folder, LEAD_TYPES_FILE)
 
 
 def proxies_for(settings):

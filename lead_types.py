@@ -13,11 +13,14 @@ reported as not checked, never quietly treated as needing — or not needing —
 the service.
 """
 
+import os
 import re
 import json
+import logging
+import tempfile
 from functools import lru_cache
 from dataclasses import dataclass, field, asdict
-from datetime import date
+from datetime import date, datetime
 from urllib.parse import urlparse
 
 import site_audit
@@ -548,3 +551,225 @@ class Judgement:
             if status == MATCH:
                 parts.append(lead_type.name + (": " + ", ".join(why) if why else ""))
         return " · ".join(parts)
+
+
+# ------------------------------------------------------------ the file
+
+FILE_VERSION = 1
+
+
+@dataclass
+class Loaded:
+    types: list
+    problem: str = ""     # shown in Settings when the file could not be used
+
+
+def load(path, logger=None):
+    """The built-in catalog, with the user's edits and own types from `path`.
+
+    An unreadable file is renamed to .bad (nothing is lost) and the built-in
+    list is used instead, with `problem` saying so. A built-in the file does
+    not mention — one a later version added — appears with its defaults.
+    """
+    logger = logger or logging.getLogger(__name__)
+    defaults = builtin_types()
+    if not os.path.exists(path):
+        return Loaded(defaults)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        entries = data.get("types") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            raise ValueError("it holds no list of lead types")
+    except (OSError, ValueError) as e:
+        kept = _set_aside(path)
+        problem = ("Your lead types file couldn't be read ({0}), so the built-in "
+                   "list is in use.".format(e))
+        if kept:
+            problem += " Your file was kept as {0}.".format(os.path.basename(kept))
+        logger.warning(problem)
+        return Loaded(defaults, problem)
+    return Loaded(_merge(entries, defaults, logger))
+
+
+def _set_aside(path):
+    target = path + ".bad"
+    if os.path.exists(target):
+        target = "{0}.bad-{1:%Y%m%d-%H%M%S}".format(path, datetime.now())
+    try:
+        os.replace(path, target)
+    except OSError:
+        return ""
+    return target
+
+
+def _merge(entries, defaults, logger):
+    index = {t.id: i for i, t in enumerate(defaults)}
+    result = list(defaults)
+    seen, warned = set(), set()
+    for raw in entries:
+        lead_type = _from_dict(raw, logger, warned)
+        if lead_type is None or lead_type.id in seen:
+            continue
+        seen.add(lead_type.id)
+        if lead_type.id in index:
+            lead_type.builtin = True
+            result[index[lead_type.id]] = lead_type
+        else:
+            lead_type.builtin = False
+            result.append(lead_type)
+    return result
+
+
+def _from_dict(raw, logger, warned):
+    if not isinstance(raw, dict):
+        logger.warning("Skipped a lead type that isn't an entry: %r", raw)
+        return None
+    name = str(raw.get("name") or "").strip()
+    if not name:
+        logger.warning("Skipped a lead type with no name.")
+        return None
+    match = raw.get("match", "any")
+    if match not in ("any", "all"):
+        logger.warning("Lead type %s says match %r; using 'any'.", name, match)
+        match = "any"
+    checks = [str(c) for c in _as_list(raw.get("checks"))]
+    for check_id in checks:
+        if check_id not in CHECKS and check_id not in warned:
+            warned.add(check_id)
+            logger.warning("Lead type %s uses a check this version doesn't know (%s); "
+                           "it reads as couldn't check.", name, check_id)
+    mentions = parse_list(raw.get("mentions"))
+    not_mentions = parse_list(raw.get("not_mentions"))
+    enabled = bool(raw.get("enabled", True))
+    if not any(c in CHECKS for c in checks) and not mentions and not not_mentions:
+        if enabled:
+            logger.warning("Lead type %s has nothing this version can check, so it "
+                           "is switched off.", name)
+        enabled = False
+    return LeadType(
+        id=str(raw.get("id") or "").strip() or new_id(name),
+        name=name,
+        group=str(raw.get("group") or "").strip() or "Custom",
+        description=str(raw.get("description") or "").strip(),
+        enabled=enabled, builtin=bool(raw.get("builtin")), match=match,
+        checks=checks, mentions=mentions, not_mentions=not_mentions)
+
+
+def _as_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return parse_list(value)
+    return []
+
+
+def save(types, path):
+    """Write the full list, atomically: a crash mid-save leaves the previous
+    file exactly as it was (the same pattern as the Excel export)."""
+    data = {"version": FILE_VERSION, "types": [t.to_dict() for t in types]}
+    folder = os.path.dirname(os.path.abspath(path)) or "."
+    handle, temp_path = tempfile.mkstemp(suffix=".json", dir=folder)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            json.dump(data, out, indent=2)
+        os.replace(temp_path, path)
+    except BaseException:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+
+
+def reset_builtins(types):
+    """Built-ins back to how they shipped; the user's own types kept."""
+    return builtin_types() + [t for t in types if not t.builtin]
+
+
+# --------------------------------------------------------------- helpers
+
+def new_id(name, taken=()):
+    base = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_") or "lead_type"
+    candidate, n = base, 2
+    while candidate in taken:
+        candidate = "{0}_{1}".format(base, n)
+        n += 1
+    return candidate
+
+
+def copy_name(name, types):
+    taken = {t.name.lower() for t in types}
+    candidate, n = "Copy of " + name, 2
+    while candidate.lower() in taken:
+        candidate = "Copy of {0} ({1})".format(name, n)
+        n += 1
+    return candidate
+
+
+def parse_list(text):
+    """"seo, website development" -> ["seo", "website development"]."""
+    if isinstance(text, list):
+        return [str(part).strip() for part in text if str(part).strip()]
+    return [part.strip() for part in str(text or "").split(",") if part.strip()]
+
+
+def resolve(values, types):
+    """(ids, unknown) for values that name a type by ID or by name, ignoring case."""
+    by_key = {}
+    for lead_type in types:
+        by_key[lead_type.id.lower()] = lead_type.id
+        by_key[lead_type.name.lower()] = lead_type.id
+    ids, unknown = [], []
+    for value in values:
+        key = str(value).strip().lower()
+        if not key:
+            continue
+        if key in by_key:
+            if by_key[key] not in ids:
+                ids.append(by_key[key])
+        else:
+            unknown.append(str(value).strip())
+    return ids, unknown
+
+
+def prune_selection(selected, types, logger=None):
+    """The selection without types that no longer exist. A switched-off type
+    stays selected — switching it back on restores it — but Selection ignores
+    it meanwhile."""
+    known = {t.id for t in types}
+    kept = []
+    for type_id in selected or []:
+        if type_id in known:
+            if type_id not in kept:
+                kept.append(type_id)
+        elif logger:
+            logger.info("Lead type %s no longer exists, so it was taken out of your "
+                        "selection.", type_id)
+    return kept
+
+
+def validate(candidate, others):
+    """What stops this type being saved, in words for the edit dialog."""
+    problems = []
+    name = candidate.name.strip()
+    if not name:
+        problems.append("Give the lead type a name.")
+    elif any(o.name.strip().lower() == name.lower() for o in others):
+        problems.append('Another lead type is already called "{0}".'.format(name))
+    if not candidate.checks and not candidate.mentions and not candidate.not_mentions:
+        problems.append("Pick at least one check, or add a keyword.")
+    return problems
+
+
+def grouped(types):
+    """[(group, [types])] in picker order: the built-in groups as GROUPS
+    lists them, then any group a user made up, alphabetically."""
+    order = {name: index for index, name in enumerate(GROUPS)}
+    groups = {}
+    for lead_type in types:
+        groups.setdefault(lead_type.group or "Custom", []).append(lead_type)
+    return sorted(groups.items(), key=lambda item: (order.get(item[0], len(order)),
+                                                     item[0].lower()))
+
+
+def group_names(types):
+    return [group for group, _members in grouped(builtin_types() + list(types))]

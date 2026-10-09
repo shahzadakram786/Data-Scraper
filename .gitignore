@@ -20,6 +20,9 @@ leads.db*
 
 # Local settings: proxy, Google service-account path, worker counts.
 config.json
+# The user's lead-type definitions, and copies set aside when unreadable.
+lead_types.json
+lead_types.json.bad*
 # Google service-account credentials
 *-service-account.json
 credentials.json
