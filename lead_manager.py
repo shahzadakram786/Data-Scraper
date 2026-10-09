@@ -81,6 +81,7 @@ class ExcelExporter:
         "Email Status": 13, "Email Confidence": 10, "Lead Score": 10,
         "First Seen": 12, "Practice Size": 12, "Annual Billing": 15,
         "Medicare Paid": 14, "Patient Volume": 13, "Phone Verified": 32,
+        "Lead Types": 60,
     }
     DEFAULT_WIDTH = 18
     # Above this many rows on a sheet, per-cell styling is skipped — see
@@ -94,7 +95,7 @@ class ExcelExporter:
 
     def export(self, store, only_sheets=None, min_score=None,
                email_statuses=None, progress=None, call_list=100,
-               call_list_icp=False):
+               call_list_icp=False, lead_types=None):
         """Write the whole database (or a filtered slice) to the workbook.
 
         Returns the number of rows written. The file is replaced atomically, so
@@ -103,6 +104,9 @@ class ExcelExporter:
 
         call_list adds a ranked "Call List" tab of that many leads at the front
         — the sheet a person actually works from. Pass 0 to leave it out.
+
+        lead_types (a lead_types.Selection) keeps only the leads it admits, on
+        every tab and on the Call List, and fills the Lead Types column.
 
         Anything typed into the existing workbook's Outreach Status, Comments,
         Date and unnamed columns (and the Call List's Outcome and Notes) is
@@ -117,9 +121,9 @@ class ExcelExporter:
         per_sheet = {}
 
         for sheet_name in sheet_names:
-            leads = list(store.iter_leads(
+            leads = _apply_lead_types(store.iter_leads(
                 sheet_key=sheet_name, min_score=min_score,
-                email_statuses=email_statuses))
+                email_statuses=email_statuses), lead_types)
             if not leads:
                 continue
             worksheet = workbook.create_sheet(sheet_name)
@@ -130,15 +134,17 @@ class ExcelExporter:
                 progress(sheet_name, len(leads))
 
         if not written:
+            chosen = (" (lead types: " + lead_types.label() + ")"
+                      if lead_types is not None and lead_types.active else "")
             self.logger.warning(
-                "Nothing matched the export filters, so " +
+                "Nothing matched the export filters" + chosen + ", so " +
                 os.path.basename(self.filename) + " was left unchanged.")
             return 0
 
         if call_list:
             self._write_call_list(workbook, store, limit=call_list,
-                                  icp_only=call_list_icp)
-        self._write_summary(workbook, store, per_sheet)
+                                  icp_only=call_list_icp, lead_types=lead_types)
+        self._write_summary(workbook, store, per_sheet, lead_types=lead_types)
         self._save(workbook)
         self.logger.info(
             "Exported " + str(written) + " leads across " + str(len(per_sheet)) +
@@ -238,7 +244,8 @@ class ExcelExporter:
         return [h for h, _w in cls.CALL_LIST_COLUMNS].index(header) + 1
     OUTCOMES = "Not Contacted,Contacted,Replied,Meeting,Won,Lost,Bad Contact"
 
-    def _write_call_list(self, workbook, store, limit=100, icp_only=False):
+    def _write_call_list(self, workbook, store, limit=100, icp_only=False,
+                         lead_types=None):
         """A ranked, self-explaining list to work from, as the first tab.
 
         Every row carries a plain-English reason, so whoever is dialling knows
@@ -246,7 +253,7 @@ class ExcelExporter:
         tells them nothing. The Outcome column is a dropdown rather than free
         text so the results stay countable later.
         """
-        leads = store.best_leads(limit=limit, icp_only=icp_only)
+        leads = store.best_leads(limit=limit, icp_only=icp_only, lead_types=lead_types)
         if not leads:
             return
 
@@ -316,7 +323,7 @@ class ExcelExporter:
         worksheet.auto_filter.ref = "A1:{0}{1}".format(
             get_column_letter(len(self.CALL_LIST_COLUMNS)), len(leads) + 1)
 
-    def _write_summary(self, workbook, store, per_sheet):
+    def _write_summary(self, workbook, store, per_sheet, lead_types=None):
         """A front tab that answers "what is in this file?" without scrolling.
 
         Deliberately the first sheet: whoever opens the workbook should see the
@@ -344,6 +351,8 @@ class ExcelExporter:
             ("Mail-server verified", "{0}  ({1:.1f}%)".format(
                 stats["verified_email"], stats["verified_email"] / total * 100)),
             ("Average lead score", stats["avg_score"]),
+            ("Lead types", lead_types.label()
+             if lead_types is not None and lead_types.active else "All leads"),
             ("", ""),
         ]
         row_number = 2
@@ -537,6 +546,22 @@ def _as_number(value):
     return int(number) if number.is_integer() else number
 
 
+def _apply_lead_types(leads, lead_types):
+    """The leads a lead-type selection admits, each with its Lead Types column
+    filled in. With no selection object at all, leads pass through unchanged
+    and the column stays blank."""
+    if lead_types is None:
+        return list(leads)
+    kept = []
+    for lead in leads:
+        judgement = lead_types.judge(lead)
+        if not judgement.admitted:
+            continue
+        lead["Lead Types"] = judgement.describe()
+        kept.append(lead)
+    return kept
+
+
 class GoogleSheetsExporter:
     """Renders the database to a Google Sheet, one worksheet per tab.
 
@@ -580,14 +605,14 @@ class GoogleSheetsExporter:
         return self.spreadsheet.url
 
     def export(self, store, only_sheets=None, min_score=None,
-               email_statuses=None, progress=None):
+               email_statuses=None, progress=None, lead_types=None):
         self._absorb_edits(store)
         fields = [EXPORT_FIELD.get(header, header) for header in EXPORT_LAYOUT]
         written = 0
         for sheet_name in (only_sheets or store.sheet_names()):
-            leads = list(store.iter_leads(
+            leads = _apply_lead_types(store.iter_leads(
                 sheet_key=sheet_name, min_score=min_score,
-                email_statuses=email_statuses))
+                email_statuses=email_statuses), lead_types)
             if not leads:
                 continue
             worksheet = self._worksheet_for(sheet_name, len(leads))
