@@ -17,6 +17,7 @@ happens.
 """
 
 import os
+import json
 import queue
 import logging
 import threading
@@ -28,11 +29,13 @@ from tkinter import ttk, scrolledtext, messagebox, filedialog
 import config
 import catalog
 import health
+import lead_types
 import storage
 import outreach
 import verification
 import ui_help
 import ui_theme as T
+import ui_lead_types as LT
 import updater
 from version import __version__
 from storage import LeadStore, RUN_OK, RUN_EMPTY, RUN_STOPPED, RUN_FAILED
@@ -224,9 +227,17 @@ class LeadGenApp:
         # The database fingerprint the screens were last drawn from. refresh()
         # skips the redraw when it has not changed.
         self._shown_version = None
+        # Lead types: the definitions, the shared selection's three bars, and
+        # the latest per-type counts (worked out off the Tk thread).
+        self.lead_type_bars = []
+        self.lead_type_counts = {}
+        self._lead_type_counts_version = None
+        self._recount_token = 0
+        self._load_lead_types()
 
         T.install(self.root)
         self._build()
+        self._refresh_lead_type_bars()
         self._setup_logging()
 
         # Work done on worker threads reaches the window only through this
@@ -703,6 +714,16 @@ class LeadGenApp:
                      fg=T.INK_FAINT, anchor="w", justify="left",
                      wraplength=680).pack(fill=tk.X, padx=(22, 0))
 
+        needs = T.Card(page, padding=18)
+        needs.pack(fill=tk.X, pady=(0, 14))
+        tk.Label(needs.inner, text="WHAT KIND OF LEADS DO YOU NEED?",
+                 font=(T.FONT, 7, "bold"), bg=T.SURFACE, fg=T.INK_FAINT,
+                 anchor="w").pack(fill=tk.X, pady=(0, 10))
+        self.collect_lead_bar = LT.LeadTypeBar(needs.inner, self.choose_lead_types,
+                                               self._remove_lead_type)
+        self.collect_lead_bar.pack(fill=tk.X)
+        self.lead_type_bars.append(self.collect_lead_bar)
+
         self.options_card = T.Card(page, padding=18)
         self.options_card.pack(fill=tk.BOTH, expand=True)
         area = self.options_card.inner
@@ -791,6 +812,7 @@ class LeadGenApp:
             self.npi_options.pack(fill=tk.BOTH, expand=True)
         else:
             self.paste_options.pack(fill=tk.BOTH, expand=True)
+        self._refresh_lead_type_bars()
         self._sync_primary()
 
     def _count_pasted_npis(self):
@@ -858,7 +880,17 @@ class LeadGenApp:
             "phone number they filed federally. Covers Medicare-enrolled "
             "providers only.",
             lambda: self.start_enrichment("cms"))
-        self.step_cms.pack(fill=tk.X)
+        self.step_cms.pack(fill=tk.X, pady=(0, 4))
+        tk.Frame(card.inner, height=1, bg=T.RULE).pack(fill=tk.X, pady=10)
+
+        self.step_sites = T.StepRow(
+            card.inner, 5, "Check websites for lead-type evidence",
+            "Reads each practice's homepage once — mobile layout, analytics, "
+            "booking, privacy policy and the rest — so lead types can be "
+            "matched. Needed for leads collected before lead types existed, and "
+            "for NPI leads once Find emails has found their website.",
+            lambda: self.start_enrichment("sites"))
+        self.step_sites.pack(fill=tk.X)
 
         options = tk.Frame(card.inner, bg=T.SURFACE)
         options.pack(fill=tk.X, pady=(16, 0))
@@ -956,6 +988,15 @@ class LeadGenApp:
                         variable=self.allow_unverified_var).pack(side=tk.LEFT,
                                                                  padx=(16, 0))
 
+        types_row = tk.Frame(controls.inner, bg=T.SURFACE)
+        types_row.pack(fill=tk.X, pady=(12, 0))
+        tk.Label(types_row, text="Lead types", font=T.F_BODY, bg=T.SURFACE,
+                 fg=T.INK).pack(side=tk.LEFT, anchor="n")
+        self.outreach_lead_bar = LT.LeadTypeBar(types_row, self.choose_lead_types,
+                                                self._remove_lead_type)
+        self.outreach_lead_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        self.lead_type_bars.append(self.outreach_lead_bar)
+
         actions = tk.Frame(controls.inner, bg=T.SURFACE)
         actions.pack(fill=tk.X, pady=(14, 0))
         ttk.Button(actions, text="Preview (no send)", style="Step.TButton",
@@ -990,7 +1031,8 @@ class LeadGenApp:
     def _campaign_filters(self):
         choice = self.audience_var.get()
         return {"icp_only": choice.startswith("Owner-operated"),
-                "owners_only": choice.startswith("Owners and")}
+                "owners_only": choice.startswith("Owners and"),
+                "lead_types": self._selection()}
 
     # --------------------------------------------------------- results
 
@@ -1008,7 +1050,8 @@ class LeadGenApp:
                 ("verified_email", "Verified", T.OK),
                 ("with_phone", "With phone", T.BRAND),
                 ("with_billing", "Billing data", T.INFO),
-                ("avg_score", "Avg. score", T.BRAND))):
+                ("avg_score", "Avg. score", T.BRAND),
+                ("not_checked", "Not checked", T.WARN))):
             cell = T.Metric(strip, label, tone=tone)
             cell.grid(row=0, column=index, sticky="w", padx=(0, 30))
             self.metrics[key] = cell
@@ -1069,6 +1112,15 @@ class LeadGenApp:
         self.score_chart = T.BarChart(trend_card.inner)
         self.score_chart.pack(fill=tk.X)
 
+        types_card = T.Card(page, padding=18)
+        types_card.pack(fill=tk.X, pady=(0, 14))
+        tk.Label(types_card.inner, text="LEADS BY LEAD TYPE", font=(T.FONT, 7, "bold"),
+                 bg=T.SURFACE, fg=T.INK_FAINT, anchor="w").pack(fill=tk.X, pady=(0, 10))
+        self.lead_type_chart = T.BarChart(
+            types_card.inner, empty_text="No lead-type evidence yet — collect from "
+                                         "Psychology Today, or run Enrich → Check websites.")
+        self.lead_type_chart.pack(fill=tk.X)
+
         export = T.Card(page, padding=16)
         export.pack(fill=tk.X)
         bar = tk.Frame(export.inner, bg=T.SURFACE)
@@ -1093,6 +1145,15 @@ class LeadGenApp:
         self.icp_only_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text="Owner-operated small practices only",
                         variable=self.icp_only_var).pack(side=tk.LEFT, padx=(14, 0))
+
+        types_row = tk.Frame(export.inner, bg=T.SURFACE)
+        types_row.pack(fill=tk.X, pady=(12, 0))
+        tk.Label(types_row, text="Lead types", font=T.F_SMALL, bg=T.SURFACE,
+                 fg=T.INK_FAINT).pack(side=tk.LEFT, anchor="n", padx=(0, 6))
+        self.results_lead_bar = LT.LeadTypeBar(types_row, self.choose_lead_types,
+                                               self._remove_lead_type)
+        self.results_lead_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.lead_type_bars.append(self.results_lead_bar)
         return outer
 
     # -------------------------------------------------------- settings
@@ -1559,6 +1620,12 @@ class LeadGenApp:
             else "{0} to look up".format(needs_cms),
             "ok" if not needs_cms else "brand",
             done=not needs_cms and stats["total"] > 0)
+        needs_sites = pending["needs_site_check"]
+        self.step_sites.set_state(
+            "Every website checked" if not needs_sites
+            else "{0} to check".format(needs_sites),
+            "ok" if not needs_sites else "brand",
+            done=not needs_sites and stats["with_website"] > 0)
 
         # --- recent runs
         for child in self.recent_runs.winfo_children():
@@ -1582,6 +1649,7 @@ class LeadGenApp:
 
         self._refresh_compliance()
         self._refresh_next_action(stats, outreach_stats, pending)
+        self._recount_lead_types()
 
     def _refresh_next_action(self, stats, outreach_stats, pending=None):
         """Pick the one thing most worth doing, from the real state of the data.
@@ -1674,6 +1742,127 @@ class LeadGenApp:
                 "", tk.END, text=sheet_key, values=values)
 
     # ===================================================================
+    # Lead types
+    # ===================================================================
+
+    def _load_lead_types(self):
+        """Read lead_types.json (or the built-ins) and drop any selected type
+        that no longer exists. Runs before the window is built, so it logs to
+        the LeadGen logger directly; a problem is also shown in Settings."""
+        log = logging.getLogger("LeadGen")
+        loaded = lead_types.load(config.lead_types_path(), log)
+        self.lead_type_defs = loaded.types
+        self.lead_types_problem = loaded.problem
+        self.settings["lead_types_selected"] = lead_types.prune_selection(
+            self.settings.get("lead_types_selected") or [], self.lead_type_defs, log)
+
+    def _selection(self):
+        """The current choice, as plain data a worker can take with it."""
+        return lead_types.Selection(self.lead_type_defs,
+                                    self.settings.get("lead_types_selected") or [])
+
+    def choose_lead_types(self):
+        LT.LeadTypePicker(self.root, self.lead_type_defs,
+                          self.settings.get("lead_types_selected") or [],
+                          on_done=self._set_lead_type_selection,
+                          on_manage=lambda: self.show("settings"))
+
+    def _set_lead_type_selection(self, ids):
+        self.settings["lead_types_selected"] = list(ids)
+        config.save(self.settings)
+        self._refresh_lead_type_bars()
+        self._recount_lead_types(force=True)
+
+    def _remove_lead_type(self, type_id):
+        self._set_lead_type_selection(
+            [i for i in self.settings.get("lead_types_selected") or [] if i != type_id])
+
+    def _refresh_lead_type_bars(self):
+        selection = self._selection()
+        note = ""
+        if (selection.active and getattr(self, "source_var", None) is not None
+                and self.source_var.get() in ("npi", "paste")):
+            note = ("NPI leads have no website yet — run Enrich → Find emails or "
+                    "Check websites before they can be matched.")
+        for bar in self.lead_type_bars:
+            bar.show(selection, note if bar is getattr(self, "collect_lead_bar", None) else "")
+
+    def _lead_types_fingerprint(self):
+        return (json.dumps([t.to_dict() for t in self.lead_type_defs], sort_keys=True)
+                + json.dumps(self.settings.get("lead_types_selected") or []))
+
+    def _recount_lead_types(self, force=False):
+        """Count matches per lead type off the Tk thread. Judging every lead
+        against every type is real work at 20,000 leads, and refresh() runs
+        on every screen change."""
+        if not self.store:
+            return
+        version = (self.store.data_version(), self._lead_types_fingerprint())
+        if not force and version == self._lead_type_counts_version:
+            return
+        self._lead_type_counts_version = version
+        self._recount_token += 1
+        token, selection, store = self._recount_token, self._selection(), self.store
+        box = queue.Queue()
+
+        def work():
+            # Holds no reference to the window, not even through self.post: if
+            # this thread held the last one when it finished, the window and
+            # its Tk variables would be destroyed here, outside Tk's main loop,
+            # which hangs Tk. The Tk thread collects the result instead.
+            try:
+                box.put(("ok", selection.tally(store.iter_leads())))
+            except Exception as e:
+                box.put(("error", e))
+
+        threading.Thread(target=work, daemon=True).start()
+        self._collect_lead_type_counts(token, selection, box)
+
+    def _collect_lead_type_counts(self, token, selection, box):
+        """On the Tk thread: show the count once the worker has finished."""
+        if self._ui_closed or token != self._recount_token:
+            return
+        try:
+            outcome, value = box.get_nowait()
+        except queue.Empty:
+            try:
+                self.root.after(self.UI_PUMP_MS, self._collect_lead_type_counts,
+                                token, selection, box)
+            except tk.TclError:
+                self._ui_closed = True
+            return
+        if outcome == "error":
+            self.logger.debug("Could not count lead types: %s", value)
+            return
+        per_type, overall = value
+        self._show_lead_type_counts(token, selection, per_type, overall)
+
+    def _show_lead_type_counts(self, token, selection, per_type, overall):
+        if token != self._recount_token:
+            return  # a newer count is on its way
+        self.lead_type_counts = dict(per_type)
+        names = {t.id: t.name for t in selection.types}
+        self.lead_type_chart.set_rows(sorted(
+            ((names[type_id], count, None) for type_id, count in per_type.items() if count),
+            key=lambda row: -row[1]))
+        self.metrics["not_checked"].set(
+            overall[lead_types.NOT_CHECKED] if selection.active else "—")
+        if hasattr(self, "lead_types_card"):
+            self.lead_types_card.show_counts(per_type)
+
+    def _with_lead_type_summary(self, pipeline, result, selection, started):
+        """Add how this run's leads fit the chosen lead types to its result.
+        Runs on the worker and touches no widgets."""
+        try:
+            summary = pipeline.lead_type_summary(selection, started)
+        except Exception as e:
+            self.logger.debug("Could not summarise lead types: %s", e)
+            return
+        if summary:
+            pipeline.reporter.log(summary)
+            result.message = " ".join(part for part in (result.message, summary) if part)
+
+    # ===================================================================
     # Running work
     # ===================================================================
 
@@ -1690,7 +1879,7 @@ class LeadGenApp:
                         "paste": "Look Up Pasted NPIs"}.get(
                             getattr(self, "source_var", None)
                             and self.source_var.get(), "Start"),
-            "enrich": "Run All Four Passes",
+            "enrich": "Run All Five Passes",
             "outreach": "Send Campaign",
             "results": "Export Spreadsheet",
             "settings": "Save Settings",
@@ -2036,11 +2225,14 @@ class LeadGenApp:
             def make_job():
                 pipeline = self._build_pipeline()
                 export = self._export_options()
+                selection = self._selection()
+                started = storage.utcnow()
 
                 def job():
                     result = pipeline.collect_psychology_today(
                         state_name, state_abbr, owners_only=owners_only,
                         resume=resume)
+                    self._with_lead_type_summary(pipeline, result, selection, started)
                     self._after_run(pipeline, result,
                                     "Psychology Today — " + state_name,
                                     export_options=export)
@@ -2063,11 +2255,14 @@ class LeadGenApp:
             def make_job():
                 pipeline = self._build_pipeline()
                 export = self._export_options()
+                selection = self._selection()
+                started = storage.utcnow()
 
                 def job():
                     result = pipeline.collect_npi(states, specialties,
                                                   exclude_corp=exclude_corp,
                                                   min_year=min_year)
+                    self._with_lead_type_summary(pipeline, result, selection, started)
                     self._after_run(pipeline, result, "NPI Registry",
                                     export_options=export)
                 return job
@@ -2085,9 +2280,12 @@ class LeadGenApp:
             def make_job():
                 pipeline = self._build_pipeline()
                 export = self._export_options()
+                selection = self._selection()
+                started = storage.utcnow()
 
                 def job():
                     result = pipeline.import_npis(numbers)
+                    self._with_lead_type_summary(pipeline, result, selection, started)
                     self._after_run(pipeline, result, "Pasted NPI numbers",
                                     export_options=export)
                 return job
@@ -2095,7 +2293,7 @@ class LeadGenApp:
             self._spawn(make_job, "Looking up {0} NPI numbers…".format(len(numbers)))
 
     def start_enrichment(self, mode):
-        """mode: find | verify | npi | cms | all."""
+        """mode: find | verify | npi | cms | sites | all."""
         recheck = self.recheck_var.get()
 
         def make_job():
@@ -2138,6 +2336,11 @@ class LeadGenApp:
                     added += result.added
                     self._after_run(pipeline, result, "Medicare data",
                                     quiet=quiet, export_options=per_pass_export)
+                if mode in ("sites", "all"):
+                    result = pipeline.check_sites(recheck=recheck)
+                    added += result.added
+                    self._after_run(pipeline, result, "Website check",
+                                    quiet=quiet, export_options=per_pass_export)
                 if mode == "all":
                     if added and self.settings.get("auto_export"):
                         try:
@@ -2145,7 +2348,7 @@ class LeadGenApp:
                         except Exception as e:
                             self.logger.error("Export failed: %s", e)
                     self.post(lambda: self.banner.set(
-                        "ok", "All four enrichment passes finished.",
+                        "ok", "All five enrichment passes finished.",
                         "Check the Results screen for what changed."))
             return job
 
@@ -2153,7 +2356,8 @@ class LeadGenApp:
                   "verify": "Verifying email addresses…",
                   "npi": "Matching NPI records…",
                   "cms": "Looking up Medicare data…",
-                  "all": "Running all four enrichment passes…"}
+                  "sites": "Checking websites for lead-type evidence…",
+                  "all": "Running all five enrichment passes…"}
         self._spawn(make_job, phases.get(mode, "Working…"))
 
     def start_export(self):
@@ -2334,6 +2538,7 @@ class LeadGenApp:
             "min_score": min_score,
             "call_list": int(self.call_list_var.get() or 0),
             "icp_only": bool(self.icp_only_var.get()),
+            "lead_types": self._selection(),
             "exporters": _load_exporters(),
         }
 
@@ -2349,12 +2554,14 @@ class LeadGenApp:
             exporter = exporters.GoogleSheetsExporter(
                 credentials, self.settings.get("google_spreadsheet"),
                 logger=self.logger)
-            return exporter.export(self.store, min_score=options["min_score"])
+            return exporter.export(self.store, min_score=options["min_score"],
+                                   lead_types=options.get("lead_types"))
         exporter = exporters.ExcelExporter(self.settings.get("excel_path"),
                                            logger=self.logger)
         return exporter.export(self.store, min_score=options["min_score"],
                                call_list=options["call_list"],
-                               call_list_icp=options["icp_only"])
+                               call_list_icp=options["icp_only"],
+                               lead_types=options.get("lead_types"))
 
     # ===================================================================
     # Live updates during a run

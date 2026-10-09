@@ -130,7 +130,7 @@ class TestWindowBuilds:
         expected = {
             "home": "Go to Next Step",
             "collect": "Collect from Psychology Today",
-            "enrich": "Run All Four Passes",
+            "enrich": "Run All Five Passes",
             "outreach": "Send Campaign",
             "results": "Export Spreadsheet",
             "settings": "Save Settings",
@@ -303,12 +303,16 @@ class TestSendGate:
         assert "Ready to send" in gui.compliance_banner.cget("text")
 
     def test_the_audience_selector_maps_to_real_filters(self, gui):
+        def audience():
+            filters = gui._campaign_filters()
+            assert filters.pop("lead_types") is not None, "the lead-type choice rides along"
+            return filters
         gui.audience_var.set("Owner-operated small practices (ICP)")
-        assert gui._campaign_filters() == {"icp_only": True, "owners_only": False}
+        assert audience() == {"icp_only": True, "owners_only": False}
         gui.audience_var.set("Owners and founders")
-        assert gui._campaign_filters() == {"icp_only": False, "owners_only": True}
+        assert audience() == {"icp_only": False, "owners_only": True}
         gui.audience_var.set("Everyone with a usable address")
-        assert gui._campaign_filters() == {"icp_only": False, "owners_only": False}
+        assert audience() == {"icp_only": False, "owners_only": False}
 
     def test_the_default_template_only_uses_real_merge_fields(self, gui):
         """A typo here would go out to every recipient as raw {{braces}}."""
@@ -373,6 +377,9 @@ class _FakePipeline:
         return self._result()
 
     def enrich_from_cms(self, recheck=False):
+        return self._result()
+
+    def check_sites(self, recheck=False):
         return self._result()
 
 
@@ -450,7 +457,7 @@ class TestResponsiveness:
         gui.start_enrichment("all")
         _wait_for_worker(gui)
 
-        assert len(fake.threads) == 4
+        assert len(fake.threads) == 5
         assert len(exports) == 1
 
     def test_a_run_that_crashes_says_so(self, gui, monkeypatch):
@@ -568,3 +575,107 @@ class TestUpdates:
                                 cwd=project, capture_output=True, text=True,
                                 timeout=180)
         assert result.returncode == 0, result.stderr
+
+
+def pump_until(gui, condition, timeout=5):
+    """Let the window process posted work until condition() holds."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        gui.root.update()
+        if condition():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class TestLeadTypes:
+    """The selector: one selection, shown on Collect, Results and Outreach,
+    and carried into every export and campaign."""
+
+    def test_three_bars_all_start_on_every_lead(self, gui):
+        assert len(gui.lead_type_bars) == 3
+        for bar in gui.lead_type_bars:
+            assert "every lead" in bar.hint.cget("text").lower()
+
+    def test_choosing_updates_every_bar_and_the_settings(self, gui):
+        gui._set_lead_type_selection(["seo"])
+        gui.root.update()
+        assert gui.settings["lead_types_selected"] == ["seo"]
+        for bar in gui.lead_type_bars:
+            assert any("SEO" in text for text in bar.pill_texts())
+
+    def test_removing_a_pill_drops_that_type(self, gui):
+        gui._set_lead_type_selection(["seo", "bookkeeping"])
+        gui._remove_lead_type("seo")
+        assert gui.settings["lead_types_selected"] == ["bookkeeping"]
+
+    def test_npi_collection_warns_that_websites_are_needed(self, gui):
+        gui.show("collect")
+        gui.source_var.set("npi")
+        gui._set_lead_type_selection(["seo"])
+        gui._sync_source()
+        assert "Check websites" in gui.collect_lead_bar.hint.cget("text")
+
+    def test_the_picker_returns_what_was_ticked(self, gui):
+        import ui_lead_types as LT
+        chosen = []
+        picker = LT.LeadTypePicker(gui.root, gui.lead_type_defs, ["seo"], on_done=chosen.append)
+        picker._vars["bookkeeping"].set(True)
+        picker.use()
+        assert chosen == [["seo", "bookkeeping"]]
+
+    def test_the_picker_filter(self, gui):
+        import ui_lead_types as LT
+        picker = LT.LeadTypePicker(gui.root, gui.lead_type_defs, [], on_done=lambda ids: None)
+        picker.filter_var.set("book")
+        gui.root.update()
+        assert set(picker.visible_ids()) == {"bookkeeping", "online_booking"}
+        picker.clear()
+        assert picker.selected_ids() == []
+        picker.destroy()
+
+    def test_exports_and_campaigns_carry_the_selection(self, gui):
+        gui._set_lead_type_selection(["seo"])
+        assert gui._export_options()["lead_types"].label() == "SEO"
+        assert gui._campaign_filters()["lead_types"].label() == "SEO"
+
+    def test_results_count_lead_types_off_the_tk_thread(self, gui):
+        import site_audit
+        gui.store.add_leads_batch([lead(Phone="(512) 471-3300", **{
+            "Site Facts": site_audit.dump_facts(
+                site_audit.no_site_facts(site_audit.NO_SITE_LISTED))})])
+        gui._set_lead_type_selection(["website_development"])
+        gui._recount_lead_types(force=True)
+        assert pump_until(gui, lambda: gui.lead_type_counts.get("website_development") == 1)
+        assert gui.metrics["not_checked"].var.get() == "0"
+
+    def test_the_counting_thread_holds_no_reference_to_the_window(self, gui, monkeypatch):
+        """If the thread kept the window alive, the window could be destroyed
+        on that thread when it finished — outside Tk's main loop, which hangs
+        Tk (it froze the test run for minutes before this was fixed)."""
+        import gc
+        import threading as threading_module
+        started = []
+        real_thread = threading_module.Thread
+
+        class RecordingThread(real_thread):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                started.append(self)
+
+        import app as app_module
+        monkeypatch.setattr(app_module.threading, "Thread", RecordingThread)
+        gui._recount_lead_types(force=True)
+        assert started, "the count runs on a thread"
+        target = started[-1]._target
+        referenced = gc.get_referents(*[cell.cell_contents
+                                        for cell in (target.__closure__ or ())])
+        closure_values = [cell.cell_contents for cell in (target.__closure__ or ())]
+        assert gui not in closure_values and gui not in referenced
+        assert not any(getattr(value, "__self__", None) is gui for value in closure_values)
+        assert pump_until(gui, lambda: "website_development" in gui.lead_type_counts)
+
+    def test_enrich_has_a_check_websites_step(self, gui):
+        gui.store.add_leads_batch([lead(Phone="(512) 471-3300", Website="https://a.example")])
+        gui.refresh(force=True)
+        assert gui.step_sites.status.cget("text") == "1 to check"
